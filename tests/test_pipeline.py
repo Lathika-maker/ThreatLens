@@ -61,6 +61,7 @@ def test_strict_schema_rejects_duplicate_names_after_normalization():
 @pytest.mark.parametrize("bad_value", ["bad", np.nan, np.inf, -np.inf])
 def test_strict_schema_rejects_invalid_numeric_values(bad_value):
     frame = valid_frame()
+    frame["feature_02"] = frame["feature_02"].astype(object)
     frame.loc[0, "feature_02"] = bad_value
     with pytest.raises(ValueError, match="non-numeric, missing, or infinite"):
         app.validate_input_frame(frame, feature_names())
