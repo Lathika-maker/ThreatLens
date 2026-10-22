@@ -357,6 +357,59 @@ def _shap_vector(row: pd.Series, bundle: dict[str, Any]) -> np.ndarray:
     return np.asarray(array, dtype=float).reshape(-1)
 
 
+def deterministic_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str:
+    """Build a concise, evidence-grounded explanation without a generative model."""
+    label = str(row.get("Prediction_Label", "UNKNOWN"))
+    probability = float(row.get("Threat_Probability", 0.0))
+    lines = [
+        f"Model assessment: {label} (XGBoost score {probability:.1%}).",
+        "This score is a model output, not a calibrated probability or proof of malicious activity.",
+        "Largest SHAP contributions for this flow:",
+    ]
+    for item in evidence:
+        direction = "pushes the model toward MALICIOUS" if item["shap_value"] > 0 else (
+            "pushes the model toward BENIGN" if item["shap_value"] < 0 else "has near-zero directional effect"
+        )
+        lines.append(
+            f"- {item['feature']} = {item['feature_value']:.4g}; SHAP {item['shap_value']:+.4g}, "
+            f"which {direction}."
+        )
+    lines.append(
+        "Interpretation: review these feature contributions alongside surrounding flows, host context, "
+        "and security telemetry before taking containment action. SHAP describes model influence, not causation."
+    )
+    return "\n".join(lines)
+
+
+@st.cache_resource(show_spinner=False)
+def load_flan_t5_pipeline():
+    """Load FLAN-T5 only after an explicit user request; cache it for reuse."""
+    from transformers import pipeline
+
+    return pipeline(
+        "text2text-generation",
+        model="google/flan-t5-small",
+        tokenizer="google/flan-t5-small",
+        device=-1,
+    )
+
+
+def generate_ai_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str:
+    """Generate a short narrative from supplied evidence; caller handles failures."""
+    facts = deterministic_narrative(row, evidence)
+    prompt = (
+        "Write a concise SOC triage explanation using ONLY the evidence below. "
+        "Do not invent attacks, causes, thresholds, IP behavior, or facts. "
+        "State that SHAP shows model contribution, not causation. If evidence is insufficient, say so.\n\n"
+        + facts
+    )
+    result = load_flan_t5_pipeline()(prompt, max_new_tokens=120, do_sample=False)
+    generated = str(result[0]["generated_text"]).strip()
+    if not generated:
+        raise ValueError("FLAN-T5 returned an empty narrative.")
+    return generated
+
+
 def explain_flow(row: pd.Series, bundle: dict[str, Any]) -> list[dict[str, Any]]:
     """Return top-three SHAP feature evidence for a single analyzed network flow."""
     values = _shap_vector(row, bundle)
@@ -557,6 +610,7 @@ def build_alert_report(row: pd.Series, bundle: dict[str, Any],
         "dest_ip": str(row.get("Dest_IP", "Unknown")),
         "port": int(float(row["Destination_Port"])),
         "probability": probability, "priority": str(row["Priority"]),
+        "prediction_label": str(row.get("Prediction_Label", "UNKNOWN")),
         "evidence": evidence, "retrieval": retrieval,
         "quantum_routed": is_routed, "quantum_score": quantum_score, "quantum_route_status": route_status,
         "warning": str(row.get("Preprocessing_Warning", "None")),
@@ -726,6 +780,37 @@ def main() -> None:
                 st.bar_chart(chart, horizontal=True)
                 st.dataframe(pd.DataFrame(report["evidence"]), hide_index=True, use_container_width=True)
                 st.caption("Absolute SHAP values rank this row's feature effects on the model output; they are not attack probabilities or causal proof.")
+
+                if st.button(
+                    "Generate AI Narrative",
+                    key=f"generate_ai_narrative_{report['flow_id']}",
+                    help="Loads google/flan-t5-small only when requested. The deterministic SHAP explanation remains the fallback.",
+                ):
+                    fallback_narrative = deterministic_narrative(
+                        pd.Series({
+                            "Prediction_Label": report["prediction_label"],
+                            "Threat_Probability": report["probability"],
+                        }),
+                        report["evidence"],
+                    )
+                    try:
+                        with st.spinner("Loading FLAN-T5 and generating an evidence-grounded narrative…"):
+                            ai_narrative = generate_ai_narrative(
+                                pd.Series({
+                                    "Prediction_Label": report["prediction_label"],
+                                    "Threat_Probability": report["probability"],
+                                }),
+                                report["evidence"],
+                            )
+                        st.markdown("**AI-generated narrative (review against the evidence):**")
+                        st.write(ai_narrative)
+                    except Exception:
+                        st.warning(
+                            "Transformer model unavailable due to cloud memory constraints. "
+                            "Defaulting to deterministic evidence."
+                        )
+                        st.markdown("**Deterministic SHAP explanation:**")
+                        st.text(fallback_narrative)
             with right:
                 technique = report["retrieval"]["technique"]
                 st.markdown(f"**MITRE ATT&CK: {technique['id']} — {technique['name']}**")
