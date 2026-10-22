@@ -5,6 +5,7 @@ on first launch; set HF_HUB_OFFLINE=1 after caching the encoder to force offline
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import os
@@ -267,7 +268,7 @@ def generate_synthetic_data(n_rows: int = 500, seed: int = 42) -> pd.DataFrame:
     return data
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(max_entries=1, show_spinner=False)
 def train_model() -> dict[str, Any]:
     """Train XGBoost on the fixed 500-row generated benchmark; never on upload labels."""
     data = generate_synthetic_data()
@@ -294,7 +295,7 @@ def train_model() -> dict[str, Any]:
     return {"model": model, "metrics": metrics, "train_min": x_train.min(), "train_max": x_train.max()}
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(max_entries=1, show_spinner=False)
 def load_embedder() -> SentenceTransformer:
     """Load MiniLM on CPU; use local cache automatically when it exists."""
     hub = Path(os.environ["HF_HOME"]) / "hub" / "models--sentence-transformers--all-MiniLM-L6-v2"
@@ -384,7 +385,7 @@ def deterministic_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> s
     return "\n".join(lines)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(max_entries=1, show_spinner=False)
 def load_flan_t5_pipeline():
     """Load FLAN-T5 only after an explicit user request; cache it for reuse."""
     from transformers import pipeline
@@ -393,7 +394,6 @@ def load_flan_t5_pipeline():
         "text2text-generation",
         model="google/flan-t5-small",
         tokenizer="google/flan-t5-small",
-        torch_dtype=torch.float16,
         model_kwargs={"low_cpu_mem_usage": True},
         device=-1,
     )
@@ -806,7 +806,8 @@ def main() -> None:
                         report["evidence"],
                     )
                     try:
-                        with st.spinner("Initializing FLAN-T5 in optimized 16-bit mode..."):
+                        gc.collect()
+                        with st.spinner("Clearing memory cache and initializing local AI..."):
                             ai_narrative = generate_ai_narrative(
                                 pd.Series({
                                     "Prediction_Label": report["prediction_label"],
