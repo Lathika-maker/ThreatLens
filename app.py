@@ -247,6 +247,10 @@ def main() -> None:
     except Exception as exc:
         bundle, artifact_error = None, str(exc)
 
+    if bundle is None and artifact_error and artifact_error.startswith("Missing trained artifacts:"):
+        st.error("Model artifacts not found. Please run train_model.py locally and commit the exported models to the repository.")
+        st.stop()
+
     supabase = get_supabase_client()
     with st.sidebar:
         st.header("Data ingestion")
