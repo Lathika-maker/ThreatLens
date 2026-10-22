@@ -462,6 +462,8 @@ def main() -> None:
         # Reconstruct raw values so the regular scaler/inference path recreates this prototype.
         mock_values = bundle["scaler"].inverse_transform(prototype)
         raw = pd.DataFrame(mock_values, columns=features)
+        # Simulation mode also feeds the preview table, so initialize it on every path.
+        preview_source = raw.head(10).copy()
         X = align_network_features(raw, features, max_rows=1)
         st.info(
             f"Simulation mode: one synthetic row reconstructed from the "
