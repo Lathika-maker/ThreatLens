@@ -11,3 +11,5 @@ CICIDS2017/
 .streamlit/secrets.toml
 *.joblib
 *.pkl
+*_40_features.csv
+prepared_*.csv
