@@ -149,8 +149,22 @@ def main() -> None:
                      ", ".join(f"{label}={count}" for label, count in too_small.items()))
 
     # Keep label space stable. Rare classes are handled by the Threat Vault, not XGBoost.
-    common_labels = sorted(counts_by_label[counts_by_label >= args.rare_threshold].index.tolist())
-    rare_labels = sorted(counts_by_label[counts_by_label < args.rare_threshold].index.tolist())
+    # Force XSS through the Threat Vault path even if its row count exceeds the
+    # general rarity threshold. It must not be trained as an XGBoost class.
+    forced_vault_labels = {"Web Attack – XSS"}
+    present_forced_labels = forced_vault_labels.intersection(set(counts_by_label.index.astype(str)))
+    common_labels = sorted(
+        label for label, count in counts_by_label.items()
+        if count >= args.rare_threshold and label not in forced_vault_labels
+    )
+    rare_labels = sorted(
+        set(counts_by_label[counts_by_label < args.rare_threshold].index.astype(str))
+        | present_forced_labels
+    )
+    missing_forced = sorted(forced_vault_labels - set(counts_by_label.index.astype(str)))
+    if missing_forced:
+        print("WARNING: forced Threat Vault label(s) not present in dataset: " +
+              ", ".join(missing_forced), flush=True)
     if len(common_labels) < 2:
         parser.error(
             f"Need at least two classes with >= {args.rare_threshold} rows for XGBoost; "
