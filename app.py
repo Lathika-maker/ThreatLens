@@ -624,9 +624,9 @@ def main() -> None:
     metrics[2].metric("OOD Anomalies", f"{int(ood.sum()):,}")
     metrics[3].metric("Mean Inference Time", f"{elapsed_ms / max(1, len(X)):.3f} ms/flow")
     st.subheader("Preprocessed network flow preview")
-    preview_df = preview_source.copy()
-    preview_df = preview_df.reset_index(drop=True)
+    preview_df = preview_source.copy().reset_index(drop=True)
     preview_count = min(len(preview_df), len(labels))
+    # Add prediction metadata without forcing Pandas Styler to render millions of cells.
     preview_df["Predicted Class"] = pd.Series(labels[:preview_count], dtype="object").reindex(range(len(preview_df)))
     preview_df["Threat Category"] = preview_df["Predicted Class"].map(
         lambda value: threat_taxonomy_category(str(value)) if pd.notna(value) else "Unknown / Requires validation"
@@ -635,22 +635,38 @@ def main() -> None:
         np.arange(len(preview_df)) < preview_count, "Analyzed", "Not analyzed (row limit)"
     )
 
-    def _style_preview_rows(_row: pd.Series) -> list[str]:
-        category = str(_row.get("Threat Category", "Unknown / Requires validation"))
-        if category == "Benign":
-            style = "background-color: #d8f3dc; color: #173b24;"
-        else:
-            style = "background-color: #5b1d25; color: #fff1f2;"
-        return [style] * len(_row)
-
     if not preview_df.empty:
+        # Keep the full dataset scrollable. Styling every cell in a large CSV can exceed
+        # Pandas Styler's render cap and allocate hundreds of MB; use a native dataframe here.
         st.dataframe(
-            preview_df.style.apply(_style_preview_rows, axis=1),
+            preview_df,
             use_container_width=True,
             height=400,
             hide_index=True,
         )
-        st.caption("Full uploaded table is scrollable. Light green = predicted benign; dark red = malicious or requires validation. Rows beyond the analysis limit are explicitly marked as not analyzed.")
+        with st.expander("Color-coded prediction sample (first 200 rows)"):
+            sample_df = preview_df.head(200).copy()
+
+            def _style_preview_rows(_row: pd.Series) -> list[str]:
+                category = str(_row.get("Threat Category", "Unknown / Requires validation"))
+                if category == "Benign":
+                    style = "background-color: #d8f3dc; color: #173b24;"
+                else:
+                    style = "background-color: #5b1d25; color: #fff1f2;"
+                return [style] * len(_row)
+
+            st.dataframe(
+                sample_df.style.apply(_style_preview_rows, axis=1),
+                use_container_width=True,
+                height=400,
+                hide_index=True,
+            )
+        st.caption(
+            "The full table is scrollable and remains unstyled for large-file safety. "
+            "The expandable 200-row sample is color-coded: light green = predicted benign; "
+            "dark red = malicious or requires validation. Rows beyond the analysis limit "
+            "are marked as not analyzed."
+        )
 
     st.subheader("Triage Overview")
     st.dataframe(results, use_container_width=True, hide_index=True)
