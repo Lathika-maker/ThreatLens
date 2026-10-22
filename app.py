@@ -370,6 +370,7 @@ def main() -> None:
         st.header("Data ingestion")
         upload = st.file_uploader("Upload CSV with exactly the 40 trained features", type=["csv"])
         simulate_sqli = st.button("Simulate SQLi Attack", help="Generate a deterministic test row from the SQL Injection vault prototype.")
+        simulate_xss = st.button("Simulate XSS Attack", help="Generate a deterministic test row from the XSS vault prototype.")
         test_mitre_pipeline = st.button("Test MITRE Pipeline", help="Run the end-to-end MITRE mapping smoke test using the SQL Injection prototype.")
         st.caption(f"Upload limit {MAX_UPLOAD_MB} MB · {MAX_ROWS:,} rows")
         st.divider()
@@ -386,18 +387,33 @@ def main() -> None:
         st.stop()
 
     features = bundle["features"]
-    simulate_mode = bool(simulate_sqli or test_mitre_pipeline)
+    simulate_mode = bool(simulate_sqli or simulate_xss or test_mitre_pipeline)
+    expected_simulation_label = (
+        "Web Attack – XSS" if simulate_xss else "Web Attack – SQL Injection"
+    )
     if simulate_mode:
-        vault_key = next((key for key in bundle["vault"] if canonical_attack_label(key) == "Web Attack – SQL Injection"), None)
+        vault_key = next(
+            (key for key in bundle["vault"]
+             if canonical_attack_label(key) == expected_simulation_label),
+            None,
+        )
         if vault_key is None:
-            st.error("SQL Injection prototype is not present in artifacts/threat_vault.json. Retrain with the updated train_model.py and confirm the dataset label spelling.")
+            st.error(
+                f"{expected_simulation_label} prototype is not present in "
+                "artifacts/threat_vault.json. Retrain with the updated train_model.py "
+                "and confirm the dataset label spelling."
+            )
             st.stop()
         prototype = np.asarray(bundle["vault"][vault_key], dtype=float).reshape(1, -1)
-        # Invert the saved scaler so the normal inference pipeline recreates the prototype.
+        # Reconstruct raw values so the regular scaler/inference path recreates this prototype.
         mock_values = bundle["scaler"].inverse_transform(prototype)
         raw = pd.DataFrame(mock_values, columns=features)
         X = validate_input_frame(raw, features, max_rows=1)
-        st.info("Simulation mode: one synthetic row reconstructed from the SQL Injection vault prototype. This verifies wiring, not real attack detection accuracy.")
+        st.info(
+            f"Simulation mode: one synthetic row reconstructed from the "
+            f"{expected_simulation_label} Threat Vault prototype. This verifies "
+            "pipeline wiring, not real attack detection accuracy."
+        )
     else:
         if upload is None:
             cards = st.columns(4)
@@ -429,10 +445,19 @@ def main() -> None:
         vault_similarities[i] = similarity
     vault_hit = np.array([value is not None for value in vault_labels], dtype=bool)
     if simulate_mode:
-        # The reconstructed prototype should match exactly, but explicitly fail closed if artifact mismatch occurs.
-        if not vault_hit[0] or canonical_attack_label(vault_labels[0]) != "Web Attack – SQL Injection":
-            st.error(f"SQLi simulation did not trigger the intended vault override (match={vault_labels[0]!r}, similarity={vault_similarities[0]:.4f}). Check that scaler.joblib and threat_vault.json were produced by the same training run.")
+        # The reconstructed prototype should match itself; fail clearly on mismatched artifacts.
+        if not vault_hit[0] or canonical_attack_label(vault_labels[0]) != expected_simulation_label:
+            st.error(
+                f"{expected_simulation_label} simulation did not trigger the intended "
+                f"vault override (match={vault_labels[0]!r}, "
+                f"similarity={vault_similarities[0]:.4f}). Check that scaler.joblib "
+                "and threat_vault.json were produced by the same training run."
+            )
             st.stop()
+        st.success(
+            f"Threat Vault override verified for {expected_simulation_label} "
+            f"(cosine similarity {vault_similarities[0]:.4f})."
+        )
     ood = np.zeros(len(X), dtype=bool)
     remaining = np.flatnonzero(~vault_hit)
     if len(remaining):
