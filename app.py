@@ -641,19 +641,44 @@ def main() -> None:
     )
 
     if not preview_df.empty:
-        # IMPORTANT: do not use Pandas Styler on uploaded data. Large CSVs can contain
-        # millions of cells and Styler raises StreamlitAPIException before the UI renders.
-        # This native Streamlit grid safely virtualizes the full table.
+        # Pandas Styler expands per-cell CSS and can exceed Streamlit's element limit on
+        # large CSVs. Apply red/green row styling to a bounded, useful preview; keep the
+        # complete dataset available in the native virtualized grid below.
+        STYLE_PREVIEW_ROWS = 1000
+        styled_preview = preview_df.head(STYLE_PREVIEW_ROWS).copy()
+
+        def _flow_row_style(row):
+            category = str(row.get("Threat Category", "Unknown / Requires validation"))
+            status = str(row.get("Analysis Status", ""))
+            if status != "Analyzed":
+                background, foreground = "#332b16", "#f6d365"  # not analyzed / amber
+            elif category == "Benign":
+                background, foreground = "#163d2b", "#d8ffe8"  # benign / green
+            else:
+                background, foreground = "#5b2028", "#ffe4e6"  # malicious / red
+            return [f"background-color: {background}; color: {foreground};" for _ in row]
+
+        st.markdown("**Threat coloring:** 🟩 Benign · 🟥 Malicious / requires validation · 🟨 Not analyzed")
         st.dataframe(
-            preview_df,
+            styled_preview.style.apply(_flow_row_style, axis=1),
             use_container_width=True,
             height=400,
             hide_index=True,
         )
+        if len(preview_df) > STYLE_PREVIEW_ROWS:
+            with st.expander(f"View remaining full dataset ({len(preview_df) - STYLE_PREVIEW_ROWS:,} additional rows)"):
+                st.dataframe(
+                    preview_df.iloc[STYLE_PREVIEW_ROWS:],
+                    use_container_width=True,
+                    height=400,
+                    hide_index=True,
+                )
         st.caption(
-            "Full uploaded table is scrollable. Review Flag identifies predicted benign rows, "
-            "predicted threats, and rows outside the analysis limit. Threat scores are model "
-            "outputs and should be corroborated with independent telemetry."
+            f"Rows are colored using model predictions for analyzed rows. The first "
+            f"{min(len(preview_df), STYLE_PREVIEW_ROWS):,} rows are color-coded; additional "
+            "rows remain available in the scrollable table. Green means predicted benign, "
+            "red means malicious or requiring validation, and amber means not analyzed. "
+            "Model scores are not proof of compromise; corroborate with independent telemetry."
         )
 
     st.subheader("Triage Overview")
