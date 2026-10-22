@@ -430,6 +430,9 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
     output.close()
     preview_parts: list[pd.DataFrame] = []
     alert_candidates = pd.DataFrame()
+    missing_features_seen: set[str] = set()
+    derived_features_total: dict[str, int] = {}
+    invalid_numeric_cells_total = 0
     total_rows = malicious_rows = high_rows = routed_rows = processed = 0
     source_name = getattr(source, "name", "network.csv")
     digest = hashlib.sha256()
@@ -441,6 +444,10 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
             for chunk_index, chunk in enumerate(chunks, start=1):
                 cleaned, prep = preprocess_network_chunk(chunk)
                 predicted = predict_chunk(cleaned, bundle)
+                missing_features_seen.update(prep.get("missing_features", []))
+                invalid_numeric_cells_total += int(prep.get("invalid_numeric_cells_replaced_with_zero", 0))
+                for feature, count in prep.get("derived_features", {}).items():
+                    derived_features_total[feature] = derived_features_total.get(feature, 0) + int(count)
                 total_rows += len(predicted)
                 malicious_rows += int(predicted["Prediction"].sum())
                 high_rows += int((predicted["Priority"] == "HIGH").sum())
@@ -465,6 +472,11 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
             "output_path": output_path, "preview": preview, "alerts": alert_candidates,
             "total_rows": total_rows, "malicious_rows": malicious_rows, "high_rows": high_rows,
             "routed_rows": routed_rows, "source_name": source_name,
+            "preprocessing": {
+                "missing_features": sorted(missing_features_seen),
+                "invalid_numeric_cells_replaced_with_zero": invalid_numeric_cells_total,
+                "derived_features": derived_features_total,
+            },
         }
     except Exception:
         try:
@@ -592,15 +604,23 @@ def main() -> None:
     st.caption("Large-file mode writes the complete preprocessed predictions to a local temporary CSV; only the preview and top 200 candidate alerts are held in memory.")
 
     with st.expander("Preprocessing diagnostics", expanded=True):
-        all_warnings = preview.get("Preprocessing_Warning", pd.Series(dtype=str))
-        warnings = sorted({str(item) for item in all_warnings if str(item) != "None"})
-        if warnings:
-            for warning in warnings:
-                st.warning(warning)
+        prep_summary = state.get("preprocessing", {})
+        missing_features = prep_summary.get("missing_features", [])
+        invalid_cells = int(prep_summary.get("invalid_numeric_cells_replaced_with_zero", 0))
+        if missing_features:
+            st.warning("Missing feature columns filled with zero: " + ", ".join(missing_features))
         else:
-            st.success("No missing model columns or invalid numeric cells were detected in the preview.")
+            st.success("All seven model feature columns were mapped or derived.")
+        st.metric("Invalid numeric cells replaced with zero (whole file)", f"{invalid_cells:,}")
+        derived_features = prep_summary.get("derived_features", {})
+        if derived_features:
+            st.write("Derived feature values counted across chunks:", derived_features)
+        preview_warnings = preview.get("Preprocessing_Warning", pd.Series(dtype=str))
+        other_warnings = sorted({str(item) for item in preview_warnings if str(item) not in {"None", ""}})
+        for warning in other_warnings:
+            st.caption(warning)
         st.write(f"Processed file: **{Path(state['output_path']).name}** (local temporary file)")
-        st.caption("The current model uses seven fixed numerical features. Different schemas are not semantically interchangeable; zero-filled features should be reviewed before trusting the score.")
+        st.caption("The model uses seven fixed numerical features. Different schemas are not semantically interchangeable; zero-filled features should be reviewed before trusting scores.")
 
     output_path = state["output_path"]
     if os.path.isfile(output_path):
