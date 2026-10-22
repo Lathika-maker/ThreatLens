@@ -449,7 +449,13 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
         first_write = True
         with open(output_path, "w", encoding="utf-8", newline="") as result_file:
             for chunk_index, chunk in enumerate(chunks, start=1):
+                source_has_id = "Flow_ID" in normalize_columns(chunk).columns
                 cleaned, prep = preprocess_network_chunk(chunk)
+                if not source_has_id:
+                    cleaned["Flow_ID"] = [
+                        f"CSV-{processed + row_offset + 1:08d}"
+                        for row_offset in range(len(cleaned))
+                    ]
                 predicted = predict_chunk(cleaned, bundle)
                 missing_features_seen.update(prep.get("missing_features", []))
                 invalid_numeric_cells_total += int(prep.get("invalid_numeric_cells_replaced_with_zero", 0))
