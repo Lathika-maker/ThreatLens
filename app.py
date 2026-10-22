@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import psutil
 import streamlit as st
+from scipy.spatial.distance import cosine
 
 st.set_page_config(page_title="ThreatLens | SOC Co-Pilot", page_icon="🛡️", layout="wide")
 
@@ -52,9 +53,36 @@ MITRE_MAP: dict[str, dict[str, str]] = {
     "Web Attack – Brute Force": {"technique": "T1110 — Brute Force", "description": "Potential repeated login attempts against a web application.", "mitigation": "Correlate web and identity logs and check whether accounts were accessed."},
     "Web Attack – XSS": {"technique": "Technique requires validation", "description": "XSS is a vulnerability class; this label alone does not establish an ATT&CK technique.", "mitigation": "Inspect application requests and input handling in an authorized environment."},
     "Web Attack – Sql Injection": {"technique": "T1190 — Exploit Public-Facing Application", "description": "Potential injection attempts against an exposed application.", "mitigation": "Review application/WAF logs, validate input handling, and patch vulnerable components."},
-    "Heartbleed": {"technique": "T1190 — Exploit Public-Facing Application (context-dependent)", "description": "The dataset class suggests Heartbleed-like traffic; confirm vulnerable software and exploit evidence.", "mitigation": "Patch affected TLS implementations and rotate secrets if exposure is confirmed."},
+    "Heartbleed": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application (context-dependent)", "description": "The dataset class suggests Heartbleed-like traffic; confirm vulnerable software and exploit evidence.", "mitigation": "Patch affected TLS implementations and rotate secrets if exposure is confirmed."},
+    "Web Attack – SQL Injection": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application", "description": "Potential SQL injection attempts against an exposed application. The dataset label is not proof of successful exploitation.", "mitigation": "Review application and WAF logs, validate parameterized queries and input handling, and patch vulnerable components."},
 }
-DEFAULT_ATTACK = {"technique": "Technique unassigned", "description": "No direct mapping is configured for this class. A model label is not proof of attribution.", "mitigation": "Validate with independent endpoint, identity, network, and application telemetry."}
+DEFAULT_ATTACK = {"tactic": "Requires validation", "technique": "Technique unassigned", "description": "No direct mapping is configured for this class. A model label is not proof of attribution.", "mitigation": "Validate with independent endpoint, identity, network, and application telemetry."}
+
+
+def canonical_attack_label(value: str) -> str:
+    """Normalize dataset spelling/case/punctuation to stable ThreatLens keys."""
+    normalized = " ".join(str(value).replace("\ufffd", "-").replace("–", "-").replace("—", "-").split()).casefold()
+    normalized = normalized.replace("sql injection", "sql injection")
+    aliases = {
+        "web attack - sql injection": "Web Attack – SQL Injection",
+        "web attack - sql injection ": "Web Attack – SQL Injection",
+        "web attack - sql injection": "Web Attack – SQL Injection",
+        "web attack - xss": "Web Attack – XSS",
+        "web attack - brute force": "Web Attack – Brute Force",
+    }
+    return aliases.get(normalized, str(value).strip())
+
+
+def get_mitre_details(attack: str) -> dict[str, str]:
+    """Prefer exact canonical class mapping; use semantic retrieval only as fallback."""
+    canonical = canonical_attack_label(attack)
+    if canonical in MITRE_MAP:
+        return MITRE_MAP[canonical]
+    folded = canonical.casefold()
+    for key, details in MITRE_MAP.items():
+        if key.casefold() == folded:
+            return details
+    return DEFAULT_ATTACK
 
 st.markdown("""
 <style>
@@ -112,6 +140,8 @@ ARTIFACT_DRIVE_IDS = {
     "artifacts/isolation_forest.joblib": "REPLACE_WITH_GDRIVE_ID",
     "artifacts/label_encoder.joblib": "REPLACE_WITH_GDRIVE_ID",
     "artifacts/imputer.joblib": "REPLACE_WITH_GDRIVE_ID",
+    "artifacts/scaler.joblib": "REPLACE_WITH_GDRIVE_ID",
+    "artifacts/threat_vault.json": "REPLACE_WITH_GDRIVE_ID",
     "artifacts/model_metadata.json": "REPLACE_WITH_GDRIVE_ID",
 }
 ARTIFACT_FILENAMES = tuple(Path(name).name for name in ARTIFACT_DRIVE_IDS)
@@ -171,6 +201,8 @@ def load_artifacts() -> dict[str, Any]:
         "ood": ARTIFACT_DIR / "isolation_forest.joblib",
         "encoder": ARTIFACT_DIR / "label_encoder.joblib",
         "imputer": ARTIFACT_DIR / "imputer.joblib",
+        "scaler": ARTIFACT_DIR / "scaler.joblib",
+        "vault": ARTIFACT_DIR / "threat_vault.json",
         "metadata": ARTIFACT_DIR / "model_metadata.json",
     }
     missing = [str(p) for p in paths.values() if not p.is_file()]
@@ -185,11 +217,18 @@ def load_artifacts() -> dict[str, Any]:
         raise ValueError("Feature metadata contains duplicate names after normalization.")
     model, ood = joblib.load(paths["model"]), joblib.load(paths["ood"])
     encoder, imputer = joblib.load(paths["encoder"]), joblib.load(paths["imputer"])
+    scaler = joblib.load(paths["scaler"])
+    threat_vault = json.loads(paths["vault"].read_text(encoding="utf-8"))
+    for class_name, vector in threat_vault.items():
+        values = np.asarray(vector, dtype=float)
+        if values.shape != (MAX_FEATURES,) or not np.isfinite(values).all():
+            raise ValueError(f"Invalid Threat Vault prototype for {class_name!r}: expected {MAX_FEATURES} finite values.")
     if hasattr(model, "n_features_in_") and int(model.n_features_in_) != len(features):
         raise ValueError("XGBoost feature count differs from model metadata.")
     if hasattr(ood, "n_features_in_") and int(ood.n_features_in_) != len(features):
         raise ValueError("Isolation Forest feature count differs from model metadata.")
     return {"model": model, "ood": ood, "encoder": encoder, "imputer": imputer,
+            "scaler": scaler, "vault": threat_vault,
             "metadata": metadata, "features": features}
 
 
@@ -213,6 +252,24 @@ def load_rag_resources():
     index = faiss.IndexFlatL2(vectors.shape[1])
     index.add(vectors)
     return index, records
+
+
+def match_threat_vault(scaled_row: np.ndarray, vault: dict[str, list[float]], threshold: float = 0.95) -> tuple[str | None, float]:
+    """Return the highest-similarity rare-class prototype above threshold."""
+    row = np.asarray(scaled_row, dtype=float).reshape(-1)
+    if row.shape != (MAX_FEATURES,) or not np.isfinite(row).all() or np.linalg.norm(row) <= 1e-12:
+        return None, 0.0
+    best_label, best_similarity = None, -1.0
+    for label, values in vault.items():
+        prototype = np.asarray(values, dtype=float).reshape(-1)
+        if prototype.shape != row.shape or not np.isfinite(prototype).all() or np.linalg.norm(prototype) <= 1e-12:
+            continue
+        similarity = 1.0 - float(cosine(row, prototype))
+        if np.isfinite(similarity) and similarity > best_similarity:
+            best_label, best_similarity = label, similarity
+    if best_label is not None and best_similarity > threshold:
+        return canonical_attack_label(best_label), best_similarity
+    return None, max(0.0, best_similarity)
 
 
 def contextual_match_confidence(squared_distance: float) -> float:
@@ -315,6 +372,8 @@ def main() -> None:
     with st.sidebar:
         st.header("Data ingestion")
         upload = st.file_uploader("Upload CSV with exactly the 40 trained features", type=["csv"])
+        simulate_sqli = st.button("Simulate SQLi Attack", help="Generate a deterministic test row from the SQL Injection vault prototype.")
+        test_mitre_pipeline = st.button("Test MITRE Pipeline", help="Run the end-to-end MITRE mapping smoke test using the SQL Injection prototype.")
         st.caption(f"Upload limit {MAX_UPLOAD_MB} MB · {MAX_ROWS:,} rows")
         st.divider()
         st.subheader("System status")
@@ -330,47 +389,77 @@ def main() -> None:
         st.stop()
 
     features = bundle["features"]
-    if upload is None:
-        cards = st.columns(4)
-        for col, label in zip(cards, ["Total Flows", "Threats", "OOD Anomalies", "Mean Triage Time"]):
-            col.metric(label, "—")
-        st.info("Upload a prepared CSV containing exactly the 40 feature columns from model_metadata.json. Do not include Label, IP, timestamp, or unrelated columns.")
-        st.stop()
-    if upload.size > MAX_UPLOAD_MB * 1024 * 1024:
-        st.error(f"Upload rejected: file exceeds {MAX_UPLOAD_MB} MB.")
-        st.stop()
-    try:
-        raw = pd.read_csv(upload, low_memory=False)
-    except Exception as exc:
-        st.error(f"CSV parsing failed: {safe_text(exc)}")
-        st.stop()
-    try:
-        X = validate_input_frame(raw, features)
-    except ValueError as exc:
-        st.error(str(exc))
-        st.caption("Select exactly the 40 features in model_metadata.json. The app never zero-fills or guesses missing measurements.")
-        st.stop()
+    simulate_mode = bool(simulate_sqli or test_mitre_pipeline)
+    if simulate_mode:
+        vault_key = next((key for key in bundle["vault"] if canonical_attack_label(key) == "Web Attack – SQL Injection"), None)
+        if vault_key is None:
+            st.error("SQL Injection prototype is not present in artifacts/threat_vault.json. Retrain with the updated train_model.py and confirm the dataset label spelling.")
+            st.stop()
+        prototype = np.asarray(bundle["vault"][vault_key], dtype=float).reshape(1, -1)
+        # Invert the saved scaler so the normal inference pipeline recreates the prototype.
+        mock_values = bundle["scaler"].inverse_transform(prototype)
+        raw = pd.DataFrame(mock_values, columns=features)
+        X = validate_input_frame(raw, features, max_rows=1)
+        st.info("Simulation mode: one synthetic row reconstructed from the SQL Injection vault prototype. This verifies wiring, not real attack detection accuracy.")
+    else:
+        if upload is None:
+            cards = st.columns(4)
+            for col, label in zip(cards, ["Total Flows", "Threats", "OOD Anomalies", "Mean Triage Time"]):
+                col.metric(label, "—")
+            st.info("Upload a prepared CSV containing exactly the 40 feature columns from model_metadata.json, or use the sidebar simulation button. Do not include Label, IP, timestamp, or unrelated columns.")
+            st.stop()
+        if upload.size > MAX_UPLOAD_MB * 1024 * 1024:
+            st.error(f"Upload rejected: file exceeds {MAX_UPLOAD_MB} MB.")
+            st.stop()
+        try:
+            raw = pd.read_csv(upload, low_memory=False)
+        except Exception as exc:
+            st.error(f"CSV parsing failed: {safe_text(exc)}")
+            st.stop()
+        try:
+            X = validate_input_frame(raw, features)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.caption("Select exactly the 40 features in model_metadata.json. The app never zero-fills or guesses missing measurements.")
+            st.stop()
 
     started = time.perf_counter()
-    ood = np.asarray(bundle["ood"].predict(X)) == -1
+    X_scaled = pd.DataFrame(bundle["scaler"].transform(X), columns=features)
+    vault_labels, vault_similarities = [], np.zeros(len(X), dtype=np.float32)
+    for i in range(len(X_scaled)):
+        match_label, similarity = match_threat_vault(X_scaled.iloc[i].to_numpy(), bundle["vault"])
+        vault_labels.append(match_label)
+        vault_similarities[i] = similarity
+    vault_hit = np.array([value is not None for value in vault_labels], dtype=bool)
+    if simulate_mode:
+        # The reconstructed prototype should match exactly, but explicitly fail closed if artifact mismatch occurs.
+        if not vault_hit[0] or canonical_attack_label(vault_labels[0]) != "Web Attack – SQL Injection":
+            st.error(f"SQLi simulation did not trigger the intended vault override (match={vault_labels[0]!r}, similarity={vault_similarities[0]:.4f}). Check that scaler.joblib and threat_vault.json were produced by the same training run.")
+            st.stop()
+    ood = np.zeros(len(X), dtype=bool)
+    remaining = np.flatnonzero(~vault_hit)
+    if len(remaining):
+        ood[remaining] = np.asarray(bundle["ood"].predict(X_scaled.iloc[remaining])) == -1
     pred = np.full(len(X), -1, dtype=np.int32)
     confidence = np.full(len(X), np.nan, dtype=np.float32)
-    trusted = np.flatnonzero(~ood)
+    confidence[vault_hit] = vault_similarities[vault_hit]
+    trusted = np.flatnonzero(~vault_hit & ~ood)
     if len(trusted):
-        probabilities = bundle["model"].predict_proba(X.iloc[trusted])
+        probabilities = bundle["model"].predict_proba(X_scaled.iloc[trusted])
         pred[trusted] = np.argmax(probabilities, axis=1)
         confidence[trusted] = np.max(probabilities, axis=1)
         del probabilities
     elapsed_ms = (time.perf_counter() - started) * 1000
     class_names = [str(v) for v in bundle["encoder"].classes_]
-    labels = ["Unknown Novel Anomaly" if ood[i] else class_names[int(pred[i])] for i in range(len(X))]
+    labels = [vault_labels[i] if vault_hit[i] else ("Unknown Novel Anomaly" if ood[i] else class_names[int(pred[i])]) for i in range(len(X))]
     benign_names = {"BENIGN", "BENIGN TRAFFIC", "NORMAL", "0"}
     malicious = np.array([not ood[i] and labels[i].strip().upper() not in benign_names for i in range(len(X))])
     severity = ["Unknown" if ood[i] else ("Critical" if malicious[i] and confidence[i] >= .9 else "High" if malicious[i] else "Low") for i in range(len(X))]
     alert_ids = [f"TL-{uuid.uuid4().hex[:10].upper()}" for _ in range(len(X))]
     results = pd.DataFrame({
         "Alert ID": alert_ids, "Threat Class": labels, "Class Confidence": confidence,
-        "Distribution Status": np.where(ood, "Unknown Novel Anomaly", "In-distribution"),
+        "Distribution Status": ["Threat Vault Override" if vault_hit[i] else "Unknown Novel Anomaly" if ood[i] else "In-distribution" for i in range(len(X))],
+        "Vault Cosine Similarity": [float(vault_similarities[i]) if vault_hit[i] else np.nan for i in range(len(X))],
         "Severity": severity,
     })
 
@@ -394,26 +483,36 @@ def main() -> None:
             for pos in positions:
                 attack = labels[pos]
                 with st.expander(f"{severity[pos]} · {attack} · {alert_ids[pos]}"):
-                    xrow = X.iloc[[pos]]
+                    xrow = X_scaled.iloc[[pos]]
                     evidence, items = "SHAP unavailable; no feature-impact claim is made.", []
+                    if vault_hit[pos]:
+                        evidence = (f"Threat Vault override matched {attack!r} with cosine similarity {vault_similarities[pos]:.4f}. "
+                                    "This is prototype similarity, not a calibrated attack probability; validate with independent telemetry.")
+                    else:
+                        try:
+                            import shap
+                            if explainer is None:
+                                explainer = shap.TreeExplainer(bundle["model"])
+                            impacts = shap_values_for_class(explainer, xrow, int(pred[pos]))
+                            evidence, items = make_evidence(xrow.iloc[0], impacts, features)
+                        except Exception as exc:
+                            st.warning(f"SHAP explanation unavailable ({type(exc).__name__}).")
+                    canonical_attack = canonical_attack_label(attack)
+                    mitre = get_mitre_details(canonical_attack)
+                    match = None
                     try:
-                        import shap
-                        if explainer is None:
-                            explainer = shap.TreeExplainer(bundle["model"])
-                        impacts = shap_values_for_class(explainer, xrow, int(pred[pos]))
-                        evidence, items = make_evidence(xrow.iloc[0], impacts, features)
+                        if canonical_attack not in MITRE_MAP:
+                            mitre, match = retrieve_mitre(attack)
                     except Exception as exc:
-                        st.warning(f"SHAP explanation unavailable ({type(exc).__name__}).")
-                    try:
-                        mitre, match = retrieve_mitre(attack)
-                    except Exception as exc:
-                        mitre, match = MITRE_MAP.get(attack, DEFAULT_ATTACK), None
                         st.warning(f"Semantic retrieval unavailable ({type(exc).__name__}); showing static guidance.")
                     left, right = st.columns([1, 1.4])
                     with left:
                         st.markdown("**Prediction evidence**")
                         st.write(f"Class: **{attack}**")
-                        st.write(f"XGBoost class confidence: **{confidence[pos] * 100:.1f}%**")
+                        if vault_hit[pos]:
+                            st.write(f"Threat Vault cosine similarity: **{vault_similarities[pos] * 100:.2f}%**")
+                        else:
+                            st.write(f"XGBoost class confidence: **{confidence[pos] * 100:.1f}%**")
                         st.write(evidence)
                         if items:
                             st.bar_chart(pd.DataFrame(items).set_index("feature")[["impact"]])
@@ -428,7 +527,8 @@ def main() -> None:
                         if st.button("Generate AI Narrative", key=f"generate-{alert_ids[pos]}"):
                             st.session_state[narrative_key] = generate_narrative(attack, evidence)
                         st.write(st.session_state.get(narrative_key, evidence))
-                        st.markdown(f"**MITRE ATT&CK context:** {mitre.get('technique', DEFAULT_ATTACK['technique'])}")
+                        st.markdown(f"**MITRE ATT&CK tactic:** {mitre.get('tactic', DEFAULT_ATTACK['tactic'])}")
+                        st.markdown(f"**MITRE ATT&CK technique:** {mitre.get('technique', DEFAULT_ATTACK['technique'])}")
                         st.write(mitre.get("description", DEFAULT_ATTACK["description"]))
                         st.markdown("**Suggested defensive validation / mitigation**")
                         st.write(mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
