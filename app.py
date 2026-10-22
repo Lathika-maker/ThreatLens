@@ -102,7 +102,11 @@ def safe_text(value: Any, limit: int = 160) -> str:
     return "".join(ch for ch in str(value) if ch.isprintable())[:limit]
 
 
-def align_network_features(uploaded_df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
+def align_network_features(
+    uploaded_df: pd.DataFrame,
+    expected_cols: list[str],
+    max_rows: int = MAX_ROWS,
+) -> pd.DataFrame:
     """Align a network CSV to the model schema and return finite float32 features.
 
     This is schema alignment, not semantic feature translation: zero-padding a
@@ -115,8 +119,8 @@ def align_network_features(uploaded_df: pd.DataFrame, expected_cols: list[str]) 
     if frame.columns.duplicated().any():
         duplicates = frame.columns[frame.columns.duplicated()].tolist()
         raise ValueError("Duplicate columns after normalization: " + ", ".join(duplicates))
-    if frame.empty or len(frame) > MAX_ROWS:
-        raise ValueError(f"Upload rejected: expected 1–{MAX_ROWS:,} rows; got {len(frame):,}.")
+    if frame.empty or len(frame) > max_rows:
+        raise ValueError(f"Upload rejected: expected 1–{max_rows:,} rows; got {len(frame):,}.")
     # Discard labels, identifiers, and foreign columns; preserve only exact expected names.
     aligned = frame.reindex(columns=expected_cols, fill_value=0)
     for name in expected_cols:
