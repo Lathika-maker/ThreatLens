@@ -321,14 +321,30 @@ def car_response_plan(attack: str, severity_value: str, is_ood: bool) -> dict[st
     return {"Contain": contain, "Analyze": analyze, "Remediate": remediate}
 
 
-def get_supabase_client():
-    try:
-        from supabase import create_client
-        url, key = st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
-        return create_client(url, key) if url and key else None
-    except Exception:
-        return None
+def append_soc_ledger(alert_id: str, threat_class: str, severity_value: str) -> Path:
+    """Append minimal incident metadata locally; raw telemetry is never written."""
+    ledger_path = Path("soc_ledger.csv")
+    row = pd.DataFrame([{"Alert ID": safe_text(alert_id, 40),
+                         "Threat Class": safe_text(threat_class, 80),
+                         "Severity": safe_text(severity_value, 40),
+                         "Timestamp": datetime.now(timezone.utc).isoformat()}])
+    row.to_csv(ledger_path, mode="a",
+              header=not ledger_path.exists() or ledger_path.stat().st_size == 0,
+              index=False, encoding="utf-8")
+    return ledger_path
 
+
+def get_model_feature_evidence(model: Any, feature_names: list[str], top_n: int = 3) -> pd.DataFrame:
+    """Map global XGBoost feature importance to the exact feature names."""
+    values = getattr(model, "feature_importances_", None)
+    if values is None:
+        return pd.DataFrame(columns=["Feature", "Importance"])
+    values = np.asarray(values, dtype=float).reshape(-1)
+    if len(values) != len(feature_names):
+        return pd.DataFrame(columns=["Feature", "Importance"])
+    selected = np.argsort(np.abs(values))[::-1][:top_n]
+    return pd.DataFrame({"Feature": [feature_names[int(i)] for i in selected],
+                         "Importance": [float(values[int(i)]) for i in selected]})
 
 def main() -> None:
     st.title("🛡️ ThreatLens")
@@ -346,7 +362,6 @@ def main() -> None:
             st.caption(f"Local artifact loading detail: {safe_text(artifact_error, 500)}")
         st.stop()
 
-    supabase = get_supabase_client()
     with st.sidebar:
         st.header("Data ingestion")
         upload = st.file_uploader(
@@ -372,7 +387,7 @@ def main() -> None:
         st.subheader("System status")
         st.write(("🟢" if bundle else "🔴") + " Trained model artifacts")
         st.write("🟡 Isolation Forest checks rows before classification")
-        st.write(("🟢" if supabase else "⚪") + " Supabase incident ledger")
+        st.write("🟢 Local SOC ledger (soc_ledger.csv)")
         if artifact_error:
             st.error(artifact_error)
 
@@ -527,19 +542,17 @@ def main() -> None:
                 attack = labels[pos]
                 with st.expander(f"{priority[pos]} · {severity[pos]} · {attack} · {alert_ids[pos]}"):
                     xrow = X_scaled.iloc[[pos]]
-                    evidence, items = "SHAP unavailable; no feature-impact claim is made.", []
+                    evidence, items = "Model feature evidence is unavailable.", []
                     if vault_hit[pos]:
                         evidence = (f"Threat Vault override matched {attack!r} with cosine similarity {vault_similarities[pos]:.4f}. "
                                     "This is prototype similarity, not a calibrated attack probability; validate with independent telemetry.")
                     else:
-                        try:
-                            import shap
-                            if explainer is None:
-                                explainer = shap.TreeExplainer(bundle["model"])
-                            impacts = shap_values_for_class(explainer, xrow, int(pred[pos]))
-                            evidence, items = make_evidence(xrow.iloc[0], impacts, features)
-                        except Exception as exc:
-                            st.warning(f"SHAP explanation unavailable ({type(exc).__name__}).")
+                        feature_evidence = get_model_feature_evidence(bundle["model"], features, top_n=3)
+                        if not feature_evidence.empty:
+                            items = [{"feature": row["Feature"], "impact": float(row["Importance"])}
+                                     for _, row in feature_evidence.iterrows()]
+                            evidence = ("Top global XGBoost feature importances are shown below. "
+                                        "They describe model-level reliance, not a row-specific causal explanation.")
                     canonical_attack = canonical_attack_label(attack)
                     mitre = get_mitre_details(canonical_attack)
                     match = None
@@ -561,10 +574,11 @@ def main() -> None:
                         st.progress(confidence_pct, text="Similarity / model score (not calibrated probability)")
                         st.write(evidence)
                         if items:
-                            st.markdown("**Top feature contributions (SHAP)**")
-                            st.bar_chart(pd.DataFrame(items).set_index("feature")[["impact"]])
-                            st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
-                            st.caption("SHAP values show how features influenced this model output; they do not independently validate real-world attack probability.")
+                            st.markdown("**Model Feature Evidence**")
+                            evidence_df = pd.DataFrame(items).rename(columns={"feature": "Feature", "impact": "Importance"})
+                            st.bar_chart(evidence_df.set_index("Feature")["Importance"])
+                            st.dataframe(evidence_df, use_container_width=True, hide_index=True)
+                            st.caption("Global XGBoost feature importances are not row-specific SHAP values, causal proof, or calibrated attack probabilities.")
                         if probability_details[pos]:
                             st.markdown("**Model class-score comparison**")
                             prob_df = pd.DataFrame(probability_details[pos])
@@ -581,9 +595,22 @@ def main() -> None:
                         st.markdown(f"**Severity:** {severity[pos]} · **Priority:** {priority[pos]}")
                         narrative_key = f"narrative-{alert_ids[pos]}"
                         if st.button("Generate AI Narrative", key=f"generate-{alert_ids[pos]}"):
-                            st.session_state[narrative_key] = generate_narrative(attack, evidence + " Response guidance: " + mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
+                            top_features = ", ".join(item["feature"] for item in items[:3]) or "feature importance unavailable"
+                            score_kind = "Threat Vault cosine similarity" if vault_hit[pos] else "XGBoost class score"
+                            score_pct = float(np.clip(confidence[pos], 0.0, 1.0)) * 100.0 if np.isfinite(confidence[pos]) else 0.0
+                            st.session_state[narrative_key] = (
+                                f"AI Analyst Note — {alert_ids[pos]}: telemetry was classified as {attack}. "
+                                f"The displayed {score_kind} is {score_pct:.1f}%; it is not a calibrated probability. "
+                                f"Top model-level features: {top_features}. Correlate with independent network, endpoint, identity, "
+                                f"and service telemetry before containment. Suggested validation/remediation: "
+                                f"{mitre.get('mitigation', DEFAULT_ATTACK['mitigation'])}"
+                            )
                         st.markdown("**Generative AI analyst narrative**")
-                        st.write(st.session_state.get(narrative_key, "Select Generate AI Narrative to produce an evidence-bounded analyst note."))
+                        narrative_text = st.session_state.get(narrative_key)
+                        if narrative_text:
+                            st.info(narrative_text)
+                        else:
+                            st.caption("Select Generate AI Narrative to create a contextual forensic note for this alert.")
                         st.markdown(f"**MITRE ATT&CK tactic:** {mitre.get('tactic', DEFAULT_ATTACK['tactic'])}")
                         st.markdown(f"**MITRE ATT&CK technique:** {mitre.get('technique', DEFAULT_ATTACK['technique'])}")
                         st.write(mitre.get("description", DEFAULT_ATTACK["description"]))
@@ -597,21 +624,11 @@ def main() -> None:
                             st.write(mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
                             st.caption("Recommendations are advisory. Validate evidence and authorization before taking containment or remediation action.")
                         if st.button("Save metadata to SOC Ledger", key=f"save-{alert_ids[pos]}"):
-                            if supabase is None:
-                                st.error("Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in Streamlit secrets.")
-                            else:
-                                safe_row = {
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "alert_id": safe_text(alert_ids[pos], 40),
-                                    "threat_class": safe_text(attack, 80),
-                                    "top_shap_features": [{"feature": safe_text(x["feature"], 80), "impact": round(float(x["impact"]), 6)} for x in items[:3]],
-                                    "mitre_technique": safe_text(mitre.get("technique", "Unassigned"), 120),
-                                }
-                                try:
-                                    supabase.table("incident_ledger").insert(safe_row).execute()
-                                    st.success("Only allowlisted incident metadata was saved; raw network rows were not sent.")
-                                except Exception as exc:
-                                    st.error(f"Ledger write failed ({type(exc).__name__}); check table schema/permissions.")
+                            try:
+                                saved_path = append_soc_ledger(alert_ids[pos], attack, severity[pos])
+                                st.success(f"Incident metadata saved to {saved_path.resolve()}. Raw telemetry was not saved.")
+                            except OSError as exc:
+                                st.error(f"Local ledger save failed ({type(exc).__name__}); check folder permissions.")
                     del xrow
                     gc.collect()
 
@@ -624,16 +641,20 @@ def main() -> None:
             st.dataframe(view, use_container_width=True, hide_index=True)
             st.caption("No class is assigned to OOD rows. Investigate using independent telemetry.")
     with ledger_tab:
-        if supabase is None:
-            st.info("Configure SUPABASE_URL and SUPABASE_KEY in Streamlit secrets to enable the ledger.")
-        else:
+        ledger_path = Path("soc_ledger.csv")
+        if ledger_path.exists() and ledger_path.stat().st_size > 0:
             try:
-                records = supabase.table("incident_ledger").select(
-                    "timestamp,alert_id,threat_class,top_shap_features,mitre_technique"
-                ).order("timestamp", desc=True).limit(500).execute().data or []
-                st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True) if records else st.info("The incident ledger is empty.")
+                ledger_df = pd.read_csv(ledger_path)
+                if "Timestamp" in ledger_df.columns:
+                    ledger_df = ledger_df.sort_values("Timestamp", ascending=False)
+                st.dataframe(ledger_df, use_container_width=True, hide_index=True)
+                st.download_button("Download SOC ledger", data=ledger_df.to_csv(index=False).encode("utf-8"),
+                    file_name="soc_ledger.csv", mime="text/csv")
             except Exception as exc:
-                st.error(f"Ledger read failed ({type(exc).__name__}); check table permissions.")
+                st.error(f"Could not read local SOC ledger ({type(exc).__name__}).")
+        else:
+            st.info("No incidents saved yet. Open an alert and select Save metadata to SOC Ledger.")
+        st.caption("The local ledger stores Alert ID, Threat Class, Severity, and Timestamp only.")
 
 
 if __name__ == "__main__":
