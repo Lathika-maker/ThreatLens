@@ -44,10 +44,16 @@ The trainer excludes recognizable identifier/time columns, drops fields that con
 
 The app intentionally rejects the original unfiltered CICIDS2017 table if it contains label, IP, timestamp, or other columns beyond the 40 selected features. Create an inference CSV with **only** the 40 columns named in `artifacts/model_metadata.json`; preserve those names and numeric values exactly. Do not include the target label. The app does not fill absent fields with zeros.
 
-To inspect the expected schema after training:
+Prepare a compatible file from a raw CICIDS CSV using the supplied helper. It selects only the trained feature columns and explicitly drops rows with invalid selected values; it never imputes or zero-fills them:
 
 ```bash
-python -c 'import json; print("\n".join(json.load(open("artifacts/model_metadata.json"))["feature_columns"]))'
+python prepare_inference_csv.py --input ./CICIDS2017/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv --output ./prepared_40_features.csv --max-rows 100000
+```
+
+Replace the example filename with a CSV that exists in your downloaded dataset. To inspect the expected schema:
+
+```bash
+python -c 'import json; print("\\n".join(json.load(open("artifacts/model_metadata.json"))["feature_columns"]))'
 ```
 
 ## 4. Run the dashboard
