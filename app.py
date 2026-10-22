@@ -23,7 +23,6 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import joblib
 import numpy as np
 import pandas as pd
-import psutil
 import streamlit as st
 from scipy.spatial.distance import cosine
 
@@ -34,7 +33,6 @@ MAX_FEATURES = 40
 MAX_UPLOAD_MB = 80
 MAX_ROWS = 100_000
 MAX_ALERTS = 100
-MIN_RAM_FOR_SLM = 600 * 1024 * 1024
 SLM_MODEL_ID = "MBZUAI/LaMini-Flan-T5-77M"
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -51,7 +49,7 @@ MITRE_MAP: dict[str, dict[str, str]] = {
     "PortScan": {"technique": "T1046 — Network Service Discovery", "description": "Connection patterns may indicate probing for exposed services.", "mitigation": "Review source scope, destination ports, asset ownership, and firewall telemetry."},
     "Infiltration": {"technique": "T1041 — Exfiltration Over C2 Channel (context-dependent)", "description": "The dataset label suggests suspicious activity but does not prove exfiltration.", "mitigation": "Review endpoint/proxy logs and unusual egress; preserve evidence."},
     "Web Attack – Brute Force": {"technique": "T1110 — Brute Force", "description": "Potential repeated login attempts against a web application.", "mitigation": "Correlate web and identity logs and check whether accounts were accessed."},
-    "Web Attack – XSS": {"technique": "Technique requires validation", "description": "XSS is a vulnerability class; this label alone does not establish an ATT&CK technique.", "mitigation": "Inspect application requests and input handling in an authorized environment."},
+    "Web Attack – XSS": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application (context-dependent)", "description": "The dataset class suggests cross-site scripting-like web attack traffic. This label alone does not prove successful exploitation.", "mitigation": "Review web and WAF logs, validate output encoding and input handling, and patch affected application components."},
     "Web Attack – Sql Injection": {"technique": "T1190 — Exploit Public-Facing Application", "description": "Potential injection attempts against an exposed application.", "mitigation": "Review application/WAF logs, validate input handling, and patch vulnerable components."},
     "Heartbleed": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application (context-dependent)", "description": "The dataset class suggests Heartbleed-like traffic; confirm vulnerable software and exploit evidence.", "mitigation": "Patch affected TLS implementations and rotate secrets if exposure is confirmed."},
     "Web Attack – SQL Injection": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application", "description": "Potential SQL injection attempts against an exposed application. The dataset label is not proof of successful exploitation.", "mitigation": "Review application and WAF logs, validate parameterized queries and input handling, and patch vulnerable components."},
@@ -68,6 +66,7 @@ def canonical_attack_label(value: str) -> str:
         "web attack - sql injection ": "Web Attack – SQL Injection",
         "web attack - sql injection": "Web Attack – SQL Injection",
         "web attack - xss": "Web Attack – XSS",
+        "web attack xss": "Web Attack – XSS",
         "web attack - brute force": "Web Attack – Brute Force",
     }
     return aliases.get(normalized, str(value).strip())
@@ -325,9 +324,7 @@ def load_narrative_pipeline():
 
 
 def generate_narrative(attack: str, evidence: str) -> str:
-    if psutil.virtual_memory().available < MIN_RAM_FOR_SLM:
-        st.warning("Available RAM is below the safety threshold; using deterministic SHAP explanation.")
-        return evidence
+    """Generate an optional evidence-bounded note without system RAM monitoring."""
     try:
         gc.collect()
         generator = load_narrative_pipeline()
