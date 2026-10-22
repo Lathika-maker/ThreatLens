@@ -151,7 +151,9 @@ def main() -> None:
     # Keep label space stable. Rare classes are handled by the Threat Vault, not XGBoost.
     # Force XSS through the Threat Vault path even if its row count exceeds the
     # general rarity threshold. It must not be trained as an XGBoost class.
-    forced_vault_labels = {"Web Attack – XSS"}
+    forced_vault_labels = {
+        "Web Attack – SQL Injection", "Heartbleed", "Infiltration", "Web Attack – XSS"
+    }
     present_forced_labels = forced_vault_labels.intersection(set(counts_by_label.index.astype(str)))
     common_labels = sorted(
         label for label, count in counts_by_label.items()
@@ -208,8 +210,11 @@ def main() -> None:
 
     # 3. Fit StandardScaler and export immediately, before model training.
     scaler = StandardScaler()
-    common_train_scaled = scaler.fit_transform(X_train_features.loc[common_mask])
+    # Fit preprocessing only on the training partition (including rare-class training rows).
+    # The held-out test partition is never used to fit imputation, selection, or scaling.
+    scaler.fit(X_train_features)
     joblib.dump(scaler, args.output_dir / "scaler.joblib", compress=3)
+    common_train_scaled = scaler.transform(X_train_features.loc[common_mask])
     print(f"Saved scaler.joblib with {len(feature_columns)} features.", flush=True)
 
     # 4. Threat Vault = per-rare-class centroid computed only from scaled training rows.
@@ -267,15 +272,67 @@ def main() -> None:
     joblib.dump(encoder, args.output_dir / "label_encoder.joblib", compress=3)
     joblib.dump(imputer, args.output_dir / "imputer.joblib", compress=3)
 
-    if len(test_encoded):
-        predictions = model.predict(X_test_common_scaled).astype(int)
-        print("\nXGBoost evaluation on held-out common classes:")
-        print(classification_report(
-            test_encoded, predictions, labels=np.arange(len(encoder.classes_)),
-            target_names=[str(c) for c in encoder.classes_], zero_division=0,
-        ))
-    else:
-        print("WARNING: held-out split has no common-class rows; evaluation skipped.")
+    # Leakage-free hybrid evaluation on every held-out test row:
+    # cosine Threat Vault override -> Isolation Forest -> XGBoost.
+    X_test_scaled = scaler.transform(X_test_features)
+    hybrid_predictions = np.full(len(X_test_scaled), "Unknown Novel Anomaly", dtype=object)
+    test_vault_hits = np.zeros(len(X_test_scaled), dtype=bool)
+    test_vault_similarities = np.zeros(len(X_test_scaled), dtype=np.float32)
+    vault_items = [
+        (label, np.asarray(vector, dtype=np.float64))
+        for label, vector in threat_vault.items()
+        if np.asarray(vector).shape == (N_FEATURES,)
+        and np.isfinite(np.asarray(vector)).all()
+        and np.linalg.norm(np.asarray(vector)) > 1e-12
+    ]
+    if vault_items:
+        # Vectorized cosine similarities avoid a Python loop over the full test set.
+        row_norms = np.linalg.norm(X_test_scaled, axis=1)
+        safe_rows = np.divide(
+            X_test_scaled, row_norms[:, None],
+            out=np.zeros_like(X_test_scaled, dtype=np.float64),
+            where=row_norms[:, None] > 1e-12,
+        )
+        proto_matrix = np.vstack([v for _, v in vault_items])
+        proto_norms = np.linalg.norm(proto_matrix, axis=1)
+        proto_matrix = proto_matrix / proto_norms[:, None]
+        similarities = safe_rows @ proto_matrix.T
+        best_idx = np.argmax(similarities, axis=1)
+        best_sim = similarities[np.arange(len(X_test_scaled)), best_idx]
+        test_vault_hits = (row_norms > 1e-12) & (best_sim > 0.95)
+        test_vault_similarities = np.maximum(best_sim, 0.0).astype(np.float32)
+        vault_names = np.asarray([label for label, _ in vault_items], dtype=object)
+        hybrid_predictions[test_vault_hits] = vault_names[best_idx[test_vault_hits]]
+
+    remaining_test = np.flatnonzero(~test_vault_hits)
+    test_ood = np.zeros(len(X_test_scaled), dtype=bool)
+    if len(remaining_test):
+        test_ood[remaining_test] = ood.predict(X_test_scaled[remaining_test]) == -1
+    xgb_rows = np.flatnonzero(~test_vault_hits & ~test_ood)
+    if len(xgb_rows):
+        test_probabilities = model.predict_proba(X_test_scaled[xgb_rows])
+        test_class_idx = np.argmax(test_probabilities, axis=1)
+        hybrid_predictions[xgb_rows] = encoder.inverse_transform(test_class_idx)
+    print("\nHybrid pipeline evaluation on the untouched 20% test split:")
+    print(f"Threat Vault overrides: {int(test_vault_hits.sum()):,}")
+    print(f"Isolation Forest unknown/OOD rows: {int(test_ood.sum()):,}")
+    print(f"Rows sent to XGBoost: {len(xgb_rows):,}")
+    all_report_labels = sorted(set(y_test_all.astype(str)) | {"Unknown Novel Anomaly"})
+    print(classification_report(
+        y_test_all.astype(str), hybrid_predictions,
+        labels=all_report_labels, target_names=all_report_labels, zero_division=0,
+    ))
+    for focus in ("Web Attack – XSS", "Web Attack – SQL Injection"):
+        focus_mask = y_test_all.astype(str).to_numpy() == focus
+        if focus_mask.any():
+            detected = hybrid_predictions[focus_mask] == focus
+            print(
+                f"{focus}: held-out support={int(focus_mask.sum())}, "
+                f"recall={float(detected.mean()):.4f}, "
+                f"vault-hit-rate={float(test_vault_hits[focus_mask].mean()):.4f}"
+            )
+        else:
+            print(f"WARNING: {focus} has no held-out test examples; recall not measurable.")
 
     metadata = {
         "feature_columns": feature_columns,
@@ -289,7 +346,7 @@ def main() -> None:
         "train_rows": int(len(train_idx)),
         "test_rows": int(len(test_idx)),
         "feature_selection_fit": "common-class training partition only",
-        "scaler_fit": "common-class training partition only",
+        "scaler_fit": "entire training partition only; never fitted on held-out test rows",
         "rare_class_threshold": int(args.rare_threshold),
         "rare_classes": rare_labels,
         "threat_vault_classes": sorted(threat_vault.keys()),
