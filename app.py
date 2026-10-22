@@ -608,7 +608,8 @@ def main() -> None:
 
     alert_tab, ood_tab, ledger_tab = st.tabs(["Threat investigation", "Unknown/OOD anomalies", "SOC incident ledger"])
     with alert_tab:
-        positions = np.flatnonzero(malicious)[:MAX_ALERTS]
+        candidate_positions = np.flatnonzero(malicious)
+        positions = candidate_positions[np.argsort(np.nan_to_num(confidence[candidate_positions], nan=-1.0))[::-1]][:MAX_ALERTS]
         if not len(positions):
             st.success("No in-distribution malicious predictions were produced.")
         else:
@@ -616,17 +617,23 @@ def main() -> None:
                 attack = labels[pos]
                 with st.expander(f"{priority[pos]} · {severity[pos]} · {attack} · {alert_ids[pos]}"):
                     xrow = X_scaled.iloc[[pos]]
-                    evidence, items = "Model feature evidence is unavailable.", []
+                    evidence, items = "Row-level SHAP evidence is unavailable.", []
                     if vault_hit[pos]:
                         evidence = (f"Threat Vault override matched {attack!r} with cosine similarity {vault_similarities[pos]:.4f}. "
                                     "This is prototype similarity, not a calibrated attack probability; validate with independent telemetry.")
                     else:
-                        feature_evidence = get_model_feature_evidence(bundle["model"], features, top_n=3)
-                        if not feature_evidence.empty:
-                            items = [{"feature": row["Feature"], "impact": float(row["Importance"])}
-                                     for _, row in feature_evidence.iterrows()]
-                            evidence = ("Top global XGBoost feature importances are shown below. "
-                                        "They describe model-level reliance, not a row-specific causal explanation.")
+                        try:
+                            import shap
+                            shap_explainer = shap.TreeExplainer(bundle["model"])
+                            impacts = shap_values_for_class(shap_explainer, xrow, int(pred[pos]))
+                            impact_values = np.asarray(impacts, dtype=float).reshape(-1)
+                            if len(impact_values) == len(features) and np.isfinite(impact_values).all():
+                                top_indices = np.argsort(np.abs(impact_values))[::-1][:3]
+                                items = [{"feature": features[int(i)], "shap_value": float(impact_values[int(i)]),
+                                          "absolute_shap": float(abs(impact_values[int(i)]))} for i in top_indices]
+                                evidence = "Row-specific SHAP values explain feature contributions to this model output; they are not attack probabilities."
+                        except Exception as exc:
+                            evidence = f"SHAP could not be calculated for this row ({type(exc).__name__}). The prediction pipeline is unchanged."
                     canonical_attack = canonical_attack_label(attack)
                     mitre = get_mitre_details(canonical_attack)
                     match = None
@@ -647,12 +654,16 @@ def main() -> None:
                             st.write(f"XGBoost class confidence: **{confidence_pct * 100:.1f}%**")
                         st.progress(confidence_pct, text="Similarity / model score (not calibrated probability)")
                         st.write(evidence)
-                        if items:
-                            st.markdown("**Model Feature Evidence**")
-                            evidence_df = pd.DataFrame(items).rename(columns={"feature": "Feature", "impact": "Importance"})
-                            st.bar_chart(evidence_df.set_index("Feature")["Importance"])
-                            st.dataframe(evidence_df, use_container_width=True, hide_index=True)
-                            st.caption("Global XGBoost feature importances are not row-specific SHAP values, causal proof, or calibrated attack probabilities.")
+                        st.markdown("### SHAP mathematical evidence — top 3 features")
+                        if items and "shap_value" in items[0]:
+                            shap_df = pd.DataFrame(items, columns=["feature", "shap_value", "absolute_shap"])
+                            st.bar_chart(shap_df.set_index("feature")["shap_value"], horizontal=True)
+                            st.dataframe(shap_df, use_container_width=True, hide_index=True)
+                        elif vault_hit[pos]:
+                            st.info("This row was routed by Threat Vault similarity; XGBoost SHAP values are not applicable to the override.")
+                        else:
+                            st.info(evidence)
+                        st.caption("Absolute SHAP values rank this row's feature effects on the model output; they are not attack probabilities or causal proof.")
                         if probability_details[pos]:
                             st.markdown("**Model class-score comparison**")
                             prob_df = pd.DataFrame(probability_details[pos])
@@ -664,6 +675,15 @@ def main() -> None:
                         st.write(f"{match:.1f}%" if match is not None else "Unavailable")
                         st.caption("Semantic proximity in the curated reference corpus, not a calibrated attack probability.")
                     with right:
+                        st.markdown("### FAISS retrieval and SOC playbook")
+                        st.markdown(f"**MITRE ATT&CK Tactic:** {mitre.get('tactic', DEFAULT_ATTACK['tactic'])}")
+                        st.markdown(f"**FAISS contextual match confidence:** {match:.1f}%" if match is not None else "**FAISS retrieval distance:** Unavailable")
+                        st.markdown("**Quantum edge-case resolver:** Not eligible")
+                        st.markdown("**SOC mitigation playbook**")
+                        _car_plan = car_response_plan(attack, severity[pos], bool(ood[pos]))
+                        st.markdown(f"- **Contain:** {_car_plan.get('Contain', ['Validate before containment.'])[0]}")
+                        st.markdown(f"- **Investigate:** {_car_plan.get('Analyze', ['Correlate independent telemetry.'])[0]}")
+                        st.markdown(f"- **Remediate:** {_car_plan.get('Remediate', ['Fix the confirmed root cause and verify the fix.'])[0]}")
                         st.markdown("**Why this matters**")
                         st.write(f"{attack} was assigned by the model pipeline. Review the evidence and corroborate it with independent telemetry before containment.")
                         st.markdown(f"**Severity:** {severity[pos]} · **Priority:** {priority[pos]}")
@@ -697,6 +717,54 @@ def main() -> None:
                         with st.expander("MITRE mitigation reference", expanded=False):
                             st.write(mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
                             st.caption("Recommendations are advisory. Validate evidence and authorization before taking containment or remediation action.")
+
+                        st.markdown("**Cryptographic Chain-of-Custody**")
+                        try:
+                            import hashlib
+                            raw_values = np.asarray(X.iloc[pos], dtype=np.float64)
+                            canonical_bytes = json.dumps(
+                                [None if not np.isfinite(v) else float(v) for v in raw_values],
+                                separators=(",", ":"), ensure_ascii=False,
+                            ).encode("utf-8")
+                            flow_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+                            shap_report_features = [
+                                {"feature": item.get("feature"), "shap_value": item.get("shap_value"),
+                                 "absolute_shap": item.get("absolute_shap")}
+                                for item in items[:3]
+                            ]
+                            forensic_report = {
+                                "report_type": "ThreatLens Incident Response Report",
+                                "schema_version": "1.0",
+                                "alert_id": alert_ids[pos],
+                                "threat_class": attack,
+                                "severity": severity[pos],
+                                "priority": priority[pos],
+                                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                                "flow_feature_sha256": flow_sha256,
+                                "hash_description": "SHA-256 of the ordered, aligned numeric feature values used for inference; it verifies this representation, not source-file authenticity.",
+                                "shap_top_features": shap_report_features,
+                                "mitre_attack": {"tactic": mitre.get("tactic", DEFAULT_ATTACK["tactic"]),
+                                                 "technique": mitre.get("technique", DEFAULT_ATTACK["technique"]),
+                                                 "contextual_match_confidence_percent": match},
+                                "faiss_mitigation_steps": _car_plan,
+                                "mitigation_reference": mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]),
+                                "limitations": [
+                                    "A hash alone does not establish chain of custody or prove source authenticity.",
+                                    "Threat Vault similarity and model scores are not calibrated attack probabilities.",
+                                    "Recommendations require analyst validation before action.",
+                                ],
+                            }
+                            st.caption(f"Flow feature SHA-256: {flow_sha256}")
+                            st.download_button(
+                                "Generate Forensic IR Report",
+                                data=json.dumps(forensic_report, indent=2, ensure_ascii=False).encode("utf-8"),
+                                file_name=f"threatlens_forensic_{alert_ids[pos]}.json",
+                                mime="application/json",
+                                key=f"forensic-report-{alert_ids[pos]}",
+                            )
+                        except Exception as exc:
+                            st.warning(f"Forensic report could not be prepared ({type(exc).__name__}).")
+
                         if st.button("Save metadata to SOC Ledger", key=f"save-{alert_ids[pos]}"):
                             try:
                                 saved_path = append_soc_ledger(alert_ids[pos], attack, severity[pos])
