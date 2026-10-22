@@ -6,3 +6,8 @@ __pycache__/
 data_store/
 .pytest_cache/
 .cache/
+artifacts/
+CICIDS2017/
+.streamlit/secrets.toml
+*.joblib
+*.pkl
