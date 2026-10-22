@@ -637,7 +637,8 @@ def main() -> None:
     m[2].metric("Quantum-Routed Edge Cases", f"{state['routed_rows']:,}")
     reports = st.session_state.get("threatlens_reports")
     mean_triage = reports.get("mean_ms") if isinstance(reports, dict) else None
-    m[3].metric("Mean Triage Time", f"{mean_triage:.2f} ms / alert" if mean_triage is not None else "Not computed yet")
+    triage_metric = m[3].empty()
+    triage_metric.metric("Mean Triage Time", f"{mean_triage:.2f} ms / alert" if mean_triage is not None else "Not computed yet")
 
     st.subheader("Preprocessed network flow preview")
     preview = state["preview"]
@@ -704,7 +705,7 @@ def main() -> None:
                         "mean_ms": elapsed / max(1, len(all_reports))}
         st.session_state["threatlens_reports"] = report_state
         reports = report_state
-        m[3].metric("Mean Triage Time", f"{reports['mean_ms']:.2f} ms / alert")
+        triage_metric.metric("Mean Triage Time", f"{reports['mean_ms']:.2f} ms / alert")
 
     for report in reports["items"]:
         title = f"{report['priority']} · {report['probability']:.1%} threat score · {report['flow_id']}"
