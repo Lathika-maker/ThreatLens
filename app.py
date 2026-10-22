@@ -394,6 +394,7 @@ def load_flan_t5_pipeline():
         model="google/flan-t5-small",
         tokenizer="google/flan-t5-small",
         torch_dtype=torch.float16,
+        model_kwargs={"low_cpu_mem_usage": True},
         device=-1,
     )
 
@@ -407,7 +408,14 @@ def generate_ai_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str
         "State that SHAP shows model contribution, not causation. If evidence is insufficient, say so.\n\n"
         + facts
     )
-    result = load_flan_t5_pipeline()(prompt, max_new_tokens=120, do_sample=False)
+    # Keep CPU decoding bounded; inference_mode avoids unnecessary autograd state.
+    with torch.inference_mode():
+        result = load_flan_t5_pipeline()(
+            prompt,
+            max_new_tokens=64,
+            do_sample=False,
+            truncation=True,
+        )
     generated = str(result[0]["generated_text"]).strip()
     if not generated:
         raise ValueError("FLAN-T5 returned an empty narrative.")
