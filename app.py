@@ -437,18 +437,41 @@ def main() -> None:
             help="Choose how many rows from the beginning of the uploaded CSV to analyze. Extra columns are automatically removed and missing model features are zero-filled.",
         )
         st.caption("Columns are aligned automatically to the model's 40 features.")
-        simulate_sqli = st.button("Simulate SQLi Attack", help="Generate a deterministic test row from the SQL Injection vault prototype.")
-        simulate_xss = st.button("Simulate XSS Attack", help="Generate a deterministic test row from the XSS vault prototype.")
-        test_mitre_pipeline = st.button("Test MITRE Pipeline", help="Run the end-to-end MITRE mapping smoke test using the SQL Injection prototype.")
+        if "active_mode" not in st.session_state:
+            st.session_state.active_mode = "csv"
+        if "current_simulated_row" not in st.session_state:
+            st.session_state.current_simulated_row = None
+        if "current_alert_context" not in st.session_state:
+            st.session_state.current_alert_context = None
+
+        def _set_simulation(mode: str) -> None:
+            st.session_state.active_mode = mode
+            st.session_state.current_simulated_row = None
+            st.session_state.current_alert_context = {"mode": mode, "selected_at": datetime.now(timezone.utc).isoformat()}
+
+        st.button("Simulate SQLi Attack", key="simulate_sqli_btn",
+                  on_click=_set_simulation, args=("sqli",),
+                  help="Generate a deterministic test row from the SQL Injection vault prototype.")
+        st.button("Simulate XSS Attack", key="simulate_xss_btn",
+                  on_click=_set_simulation, args=("xss",),
+                  help="Generate a deterministic test row from the XSS vault prototype.")
+        st.button("Test MITRE Pipeline", key="test_mitre_btn",
+                  on_click=_set_simulation, args=("mitre",),
+                  help="Run the end-to-end MITRE mapping smoke test using the SQL Injection prototype.")
+        st.button("Analyze uploaded CSV", key="analyze_uploaded_csv_btn",
+                  on_click=_set_simulation, args=("csv",),
+                  help="Switch from simulation mode back to the uploaded CSV.")
         st.caption(f"File limit {MAX_UPLOAD_MB} MB · up to {analysis_row_limit:,} rows per analysis")
         st.divider()
         st.subheader("System status")
-        st.write("🟢 Local ML Engine: Online")
-        st.write("🟢 FAISS: Loaded")
-        st.write("🟢 QPU Simulator: Ready (default.qubit)")
+        st.write(f"{'🟢' if bundle is not None and bundle.get('model') is not None else '🔴'} Local ML Engine: {'Online' if bundle is not None and bundle.get('model') is not None else 'Unavailable'}")
+        faiss_ready = bool(bundle is not None and bundle.get("index") is not None)
+        st.write(f"{'🟢' if faiss_ready else '🔴'} FAISS: {'Loaded' if faiss_ready else 'Not initialized'}")
+        st.write("🟡 QPU Simulator: Display-only status (not used by current inference path)")
         st.write("🟢 Zero Data Leakage: flow data stays local")
-        st.caption("Status reflects configured local pipeline components; quantum routing is not part of this inference path.")
-        st.write("🟢 Local SOC ledger (soc_ledger.csv)")
+        st.caption("Status reflects components exposed by the current local app; quantum routing is not part of this inference path.")
+        ledger_path = get_soc_ledger_path()
+        st.write(f"{'🟢' if ledger_path.parent.exists() and os.access(ledger_path.parent, os.W_OK) else '🔴'} Local SOC ledger: {'Writable' if os.access(ledger_path.parent, os.W_OK) else 'Not writable'}")
         if artifact_error:
             st.error(artifact_error)
 
@@ -458,10 +481,12 @@ def main() -> None:
         st.stop()
 
     features = bundle["features"]
-    simulate_mode = bool(simulate_sqli or simulate_xss or test_mitre_pipeline)
-    expected_simulation_label = (
-        "Web Attack – XSS" if simulate_xss else "Web Attack – SQL Injection"
-    )
+    active_mode = st.session_state.get("active_mode", "csv")
+    simulate_sqli = active_mode == "sqli"
+    simulate_xss = active_mode == "xss"
+    test_mitre_pipeline = active_mode == "mitre"
+    simulate_mode = active_mode in {"sqli", "xss", "mitre"}
+    expected_simulation_label = "Web Attack – XSS" if simulate_xss else "Web Attack – SQL Injection"
     if simulate_mode:
         vault_key = next(
             (key for key in bundle["vault"]
@@ -502,8 +527,8 @@ def main() -> None:
         except Exception as exc:
             st.error(f"CSV parsing failed: {safe_text(exc)}")
             st.stop()
-        # Keep the original uploaded schema for the preview; inference remains unchanged.
-        preview_source = raw.head(10).copy()
+        # Preserve the full uploaded dataframe for the scrollable preview; inference can still be row-limited.
+        preview_source = raw.copy()
         try:
             # Respect the user-selected row limit without rejecting larger CSVs.
             # Analyze the first N rows; all columns still pass through universal alignment.
@@ -577,7 +602,14 @@ def main() -> None:
         else "P4 — Monitor"
         for i in range(len(X))
     ]
-    alert_ids = [f"TL-{uuid.uuid4().hex[:10].upper()}" for _ in range(len(X))]
+    # Stable IDs keep per-alert UI state attached to the same flow across Streamlit reruns.
+    import hashlib
+    alert_ids = [
+        "TL-" + hashlib.sha256(
+            (str(i) + "|" + ",".join(f"{float(v):.12g}" for v in X.iloc[i].to_numpy(dtype=float))).encode("utf-8")
+        ).hexdigest()[:10].upper()
+        for i in range(len(X))
+    ]
     results = pd.DataFrame({
         "Alert ID": alert_ids, "Threat Class": labels, "Severity": severity, "Priority": priority,
         "Class Confidence": confidence,
@@ -592,14 +624,19 @@ def main() -> None:
     metrics[2].metric("OOD Anomalies", f"{int(ood.sum()):,}")
     metrics[3].metric("Mean Inference Time", f"{elapsed_ms / max(1, len(X)):.3f} ms/flow")
     st.subheader("Preprocessed network flow preview")
-    preview_df = preview_source.head(10).copy()
+    preview_df = preview_source.copy()
+    preview_df = preview_df.reset_index(drop=True)
     preview_count = min(len(preview_df), len(labels))
-    preview_labels = labels[:preview_count]
+    preview_df["Predicted Class"] = pd.Series(labels[:preview_count], dtype="object").reindex(range(len(preview_df)))
+    preview_df["Threat Category"] = preview_df["Predicted Class"].map(
+        lambda value: threat_taxonomy_category(str(value)) if pd.notna(value) else "Unknown / Requires validation"
+    )
+    preview_df["Analysis Status"] = np.where(
+        np.arange(len(preview_df)) < preview_count, "Analyzed", "Not analyzed (row limit)"
+    )
 
     def _style_preview_rows(_row: pd.Series) -> list[str]:
-        row_index = int(_row.name) if isinstance(_row.name, (int, np.integer)) else -1
-        predicted_label = preview_labels[row_index] if 0 <= row_index < len(preview_labels) else "Unknown Novel Anomaly"
-        category = threat_taxonomy_category(predicted_label)
+        category = str(_row.get("Threat Category", "Unknown / Requires validation"))
         if category == "Benign":
             style = "background-color: #d8f3dc; color: #173b24;"
         else:
@@ -610,15 +647,10 @@ def main() -> None:
         st.dataframe(
             preview_df.style.apply(_style_preview_rows, axis=1),
             use_container_width=True,
+            height=400,
             hide_index=True,
         )
-        taxonomy_preview = pd.DataFrame({
-            "Predicted Class": labels[:preview_count],
-            "Threat Category": [threat_taxonomy_category(label) for label in labels[:preview_count]],
-        })
-        with st.expander("Preview threat taxonomy"):
-            st.dataframe(taxonomy_preview, use_container_width=True, hide_index=True)
-        st.caption("Light green = predicted benign; dark red = predicted malicious or requiring validation. Colors reflect predictions, not ground truth.")
+        st.caption("Full uploaded table is scrollable. Light green = predicted benign; dark red = malicious or requires validation. Rows beyond the analysis limit are explicitly marked as not analyzed.")
 
     st.subheader("Triage Overview")
     st.dataframe(results, use_container_width=True, hide_index=True)
