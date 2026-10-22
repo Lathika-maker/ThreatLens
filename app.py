@@ -25,10 +25,13 @@ import pandas as pd
 import pennylane as qml
 import shap
 import streamlit as st
+import torch
 import xgboost as xgb
 from sentence_transformers import SentenceTransformer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+torch.set_num_threads(1)
 
 APP_TITLE = "ThreatLens | Hybrid SOC Co-Pilot"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -390,6 +393,7 @@ def load_flan_t5_pipeline():
         "text2text-generation",
         model="google/flan-t5-small",
         tokenizer="google/flan-t5-small",
+        torch_dtype=torch.float16,
         device=-1,
     )
 
@@ -794,7 +798,7 @@ def main() -> None:
                         report["evidence"],
                     )
                     try:
-                        with st.spinner("Loading FLAN-T5 and generating an evidence-grounded narrative…"):
+                        with st.spinner("Initializing FLAN-T5 in optimized 16-bit mode..."):
                             ai_narrative = generate_ai_narrative(
                                 pd.Series({
                                     "Prediction_Label": report["prediction_label"],
@@ -806,7 +810,7 @@ def main() -> None:
                         st.write(ai_narrative)
                     except Exception:
                         st.warning(
-                            "Transformer model unavailable due to cloud memory constraints. "
+                            "FLAN-T5 generation failed in this runtime. "
                             "Defaulting to deterministic evidence."
                         )
                         st.markdown("**Deterministic SHAP explanation:**")
