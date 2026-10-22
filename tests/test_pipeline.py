@@ -116,7 +116,16 @@ def test_chunked_csv_analysis_streams_all_rows_and_preserves_preview(bundle):
         assert len(result["alerts"]) <= 200
         on_disk = pd.read_csv(result["output_path"])
         assert len(on_disk) == 500
-        assert {"Prediction", "Threat_Probability", "Preprocessing_Warning"}.issubset(on_disk.columns)
+        assert {"Prediction", "Threat_Probability", "Preprocessing_Warning",
+                "Quantum_Eligible", "Quantum_Routed", "Quantum_Risk_Score"}.issubset(on_disk.columns)
+        probabilities = on_disk["Threat_Probability"]
+        in_interval = probabilities.between(app.EDGE_LOW, app.EDGE_HIGH)
+        assert not (on_disk["Quantum_Routed"].astype(bool) & ~in_interval).any()
+        assert int(on_disk["Quantum_Routed"].astype(bool).sum()) == result["routed_rows"]
+        assert result["routed_rows"] <= app.MAX_QUANTUM_EVALUATIONS
+        assert result["eligible_rows"] >= result["routed_rows"]
+        scores = on_disk.loc[on_disk["Quantum_Routed"].astype(bool), "Quantum_Risk_Score"]
+        assert scores.between(0, 1).all()
     finally:
         if os.path.exists(result["output_path"]):
             os.unlink(result["output_path"])
