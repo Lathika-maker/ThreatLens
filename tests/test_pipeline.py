@@ -1,180 +1,102 @@
-"""Tests for ThreatLens preprocessing and hybrid local inference."""
+"""Focused tests for ThreatLens schema safety and evidence logic."""
 from __future__ import annotations
-
-import io
-import os
 
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 
 import app
+import prepare_inference_csv
+import train_model
 
 
-def test_mitre_knowledge_base_has_six_complete_entries():
-    assert set(app.MITRE) == {"T1046", "T1110", "T1071", "T1499", "T1190", "T1078"}
-    for key, item in app.MITRE.items():
-        assert item["id"] == key
-        assert item["name"] and item["tactic"] and item["description"]
-        assert len(item["mitigations"]) == 3
+def feature_names():
+    return [f"feature_{i:02d}" for i in range(40)]
 
 
-def test_column_normalization_maps_common_cicids_names():
-    frame = pd.DataFrame(columns=[
-        "Destination Port", "Flow Duration", "Total Fwd Packets",
-        "Total Backward Packets", "Flow Bytes/s", "Average Packet Size",
-        "SYN Flag Count", "Src IP", "Dst IP",
-    ])
-    normalized = app.normalize_columns(frame)
-    assert set(app.FEATURES).issubset(normalized.columns)
-    assert {"Source_IP", "Dest_IP"}.issubset(normalized.columns)
+def valid_frame(rows=2):
+    return pd.DataFrame(
+        {name: np.arange(rows, dtype=np.float64) + i for i, name in enumerate(feature_names())}
+    )
 
 
-def test_preprocessor_cleans_invalid_values_and_explains_missing_features():
-    raw = pd.DataFrame([{
-        "Destination Port": "443", "Flow Duration": "inf",
-        "Total Fwd Packets": "oops", "Total Backward Packets": 8,
-        "Flow Bytes/s": np.nan, "Average Packet Size": 400, "SYN Flag Count": 3,
-    }])
-    cleaned, report = app.preprocess_network_chunk(raw)
-    assert set(app.FEATURES).issubset(cleaned.columns)
-    assert cleaned.loc[0, "Destination_Port"] == 443
-    assert cleaned.loc[0, "Flow_Duration"] == 0
-    assert cleaned.loc[0, "Total_Fwd_Packets"] == 0
-    assert report["invalid_numeric_cells_replaced_with_zero"] >= 3
-    assert "None" not in cleaned.loc[0, "Preprocessing_Warning"]
+def test_feature_contract_is_exactly_40_columns():
+    assert app.MAX_FEATURES == 40
+    assert len(feature_names()) == app.MAX_FEATURES
 
 
-def test_preprocessor_derives_flow_bytes_rate_from_total_bytes():
-    raw = pd.DataFrame([{
-        "Flow Duration": 2_000_000,
-        "Total Fwd Packets": 10,
-        "Total Backward Packets": 5,
-        "Total Length of Fwd Packets": 1000,
-        "Total Length of Bwd Packets": 500,
-        "Destination Port": 443,
-        "Average Packet Size": 100,
-        "SYN Flag Count": 1,
-    }])
-    cleaned, report = app.preprocess_network_chunk(raw)
-    assert cleaned.loc[0, "Flow_Bytes_s"] == pytest.approx(750)
-    assert report["derived_features"]["Flow_Bytes_s"] == 1
+def test_normalizers_trim_bom_and_convert_spaces():
+    assert app.normalize_column("\ufeffDestination Port ") == "Destination_Port"
+    assert train_model.normalize("Flow Duration") == "Flow_Duration"
+    assert prepare_inference_csv.normalize("Flow Duration") == "Flow_Duration"
 
 
-def test_arbitrary_schema_is_processed_but_missing_fields_are_disclosed():
-    cleaned, report = app.preprocess_network_chunk(pd.DataFrame({"timestamp": ["2026-01-01"], "bytes": [5]}))
-    assert set(app.FEATURES).issubset(cleaned.columns)
-    assert len(report["missing_features"]) > 0
-    assert "filled with zero" in cleaned.loc[0, "Preprocessing_Warning"]
+def test_exact_schema_accepts_valid_numeric_frame_as_float32():
+    result = app.validate_input_frame(valid_frame(), feature_names())
+    assert list(result.columns) == feature_names()
+    assert result.shape == (2, 40)
+    assert all(dtype == np.dtype("float32") for dtype in result.dtypes)
 
 
-def test_synthetic_dataset_has_500_rows_and_binary_labels():
-    data = app.generate_synthetic_data(500, seed=7)
-    assert len(data) == 500
-    assert set(app.FEATURES).issubset(data.columns)
-    assert set(data["Label"].unique()) == {0, 1}
-    assert {"Flow_ID", "Source_IP", "Dest_IP"}.issubset(data.columns)
+def test_strict_schema_rejects_missing_feature():
+    frame = valid_frame().drop(columns=["feature_03"])
+    with pytest.raises(ValueError, match="missing required features"):
+        app.validate_input_frame(frame, feature_names())
 
 
-@pytest.fixture(scope="module")
-def bundle():
-    return app.train_model()
+def test_strict_schema_rejects_extra_label_column():
+    frame = valid_frame()
+    frame["Label"] = "BENIGN"
+    with pytest.raises(ValueError, match="unexpected columns"):
+        app.validate_input_frame(frame, feature_names())
 
 
-def test_xgboost_bundle_and_prediction(bundle):
-    assert bundle["metrics"]["test_rows"] == 125
-    assert 0 <= bundle["metrics"]["accuracy"] <= 1
-    sample, _ = app.preprocess_network_chunk(app.generate_synthetic_data(30))
-    predicted = app.predict_chunk(sample, bundle)
-    assert {"Threat_Probability", "Prediction", "Prediction_Label", "Priority", "Quantum_Routed"}.issubset(predicted.columns)
-    assert predicted["Threat_Probability"].between(0, 1).all()
-    assert set(predicted["Prediction"].unique()).issubset({0, 1})
+def test_strict_schema_rejects_duplicate_names_after_normalization():
+    frame = valid_frame()
+    frame["feature 00"] = frame["feature_00"]
+    with pytest.raises(ValueError, match="duplicate normalized columns"):
+        app.validate_input_frame(frame, feature_names())
 
 
-def test_shap_explanation_returns_top_three(bundle):
-    sample, _ = app.preprocess_network_chunk(app.generate_synthetic_data(20))
-    predicted = app.predict_chunk(sample, bundle)
-    explanation = app.explain_flow(predicted.iloc[0], bundle)
-    assert len(explanation) == 3
-    assert all(item["feature"] in app.FEATURES for item in explanation)
-    assert all(item["absolute_shap"] >= 0 for item in explanation)
+@pytest.mark.parametrize("bad_value", ["bad", np.nan, np.inf, -np.inf])
+def test_strict_schema_rejects_invalid_numeric_values(bad_value):
+    frame = valid_frame()
+    frame.loc[0, "feature_02"] = bad_value
+    with pytest.raises(ValueError, match="non-numeric, missing, or infinite"):
+        app.validate_input_frame(frame, feature_names())
 
 
-def test_deterministic_narrative_uses_shap_evidence():
-    row = pd.Series({"Prediction_Label": "MALICIOUS", "Threat_Probability": 0.87})
-    evidence = [
-        {"feature": "Destination_Port", "feature_value": 443, "shap_value": 0.31, "absolute_shap": 0.31},
-        {"feature": "Flow_Duration", "feature_value": 12, "shap_value": -0.08, "absolute_shap": 0.08},
-    ]
-    narrative = app.deterministic_narrative(row, evidence)
-    assert "MALICIOUS" in narrative
-    assert "87.0%" in narrative
-    assert "Destination_Port = 443" in narrative
-    assert "SHAP +0.31" in narrative
-    assert "SHAP describes model influence, not causation" in narrative
+def test_row_limit_is_checked_before_inference():
+    with pytest.raises(ValueError, match="expected 1–1 data rows"):
+        app.validate_input_frame(valid_frame(rows=2), feature_names(), max_rows=1)
 
 
-def test_generate_ai_narrative_uses_compact_pipeline_and_bounded_generation(monkeypatch):
-    calls = {}
-
-    class FakePipeline:
-        def __call__(self, prompt, **kwargs):
-            calls["prompt"] = prompt
-            calls["kwargs"] = kwargs
-            return [{"generated_text": "Review the flow alongside related telemetry."}]
-
-    monkeypatch.setattr(app, "load_flan_t5_pipeline", lambda: FakePipeline())
-    row = pd.Series({"Prediction_Label": "MALICIOUS", "Threat_Probability": 0.87})
-    evidence = [
-        {"feature": "Destination_Port", "feature_value": 443, "shap_value": 0.31, "absolute_shap": 0.31},
-    ]
-    narrative = app.generate_ai_narrative(row, evidence)
-    assert narrative == "Review the flow alongside related telemetry."
-    assert "Destination_Port = 443" in calls["prompt"]
-    assert calls["kwargs"]["max_new_tokens"] == 40
-    assert calls["kwargs"]["do_sample"] is False
-    assert calls["kwargs"]["truncation"] is True
+@pytest.mark.parametrize(
+    ("distance", "expected"),
+    [(0.0, 100.0), (1.0, 75.0), (2.0, 50.0), (4.0, 0.0), (9.0, 0.0)],
+)
+def test_contextual_match_confidence_is_bounded(distance, expected):
+    assert app.contextual_match_confidence(distance) == pytest.approx(expected)
 
 
-def test_generate_ai_narrative_rejects_empty_model_output(monkeypatch):
-    class EmptyPipeline:
-        def __call__(self, prompt, **kwargs):
-            return [{"generated_text": "   "}]
+def test_shap_class_extraction_supports_samples_features_classes_layout():
+    class Explainer:
+        def shap_values(self, _frame):
+            return np.array([[[0.1, 0.2], [0.3, -0.4], [0.5, 0.9]]])
 
-    monkeypatch.setattr(app, "load_flan_t5_pipeline", lambda: EmptyPipeline())
-    row = pd.Series({"Prediction_Label": "BENIGN", "Threat_Probability": 0.12})
-    with pytest.raises(ValueError, match="empty narrative"):
-        app.generate_ai_narrative(row, [])
-
-
-def test_quantum_score_is_mapped_to_zero_one(bundle):
-    sample, _ = app.preprocess_network_chunk(app.generate_synthetic_data(10))
-    predicted = app.predict_chunk(sample, bundle)
-    score = app.quantum_risk_score(predicted.iloc[0], bundle)
-    assert 0.0 <= score <= 1.0
+    row = pd.DataFrame([[1.0, 2.0, 3.0]], columns=["a", "b", "c"])
+    result = app.shap_values_for_class(Explainer(), row, class_index=1)
+    np.testing.assert_allclose(result, [0.2, -0.4, 0.9])
 
 
-def test_chunked_csv_analysis_streams_all_rows_and_preserves_preview(bundle):
-    data = app.generate_synthetic_data(500).drop(columns=["Flow_ID"])
-    result = app.analyze_csv_in_chunks(io.StringIO(data.to_csv(index=False)), bundle, chunk_size=73)
-    try:
-        assert result["total_rows"] == 500
-        assert len(result["preview"]) == 500
-        assert len(result["alerts"]) <= 200
-        on_disk = pd.read_csv(result["output_path"])
-        assert len(on_disk) == 500
-        assert {"Flow_ID", "Prediction", "Threat_Probability", "Preprocessing_Warning",
-                "Quantum_Eligible", "Quantum_Routed", "Quantum_Risk_Score"}.issubset(on_disk.columns)
-        assert on_disk["Flow_ID"].is_unique
-        probabilities = on_disk["Threat_Probability"]
-        in_interval = probabilities.between(app.EDGE_LOW, app.EDGE_HIGH)
-        assert not (on_disk["Quantum_Routed"].astype(bool) & ~in_interval).any()
-        assert int(on_disk["Quantum_Routed"].astype(bool).sum()) == result["routed_rows"]
-        assert result["routed_rows"] <= app.MAX_QUANTUM_EVALUATIONS
-        assert result["eligible_rows"] >= result["routed_rows"]
-        scores = on_disk.loc[on_disk["Quantum_Routed"].astype(bool), "Quantum_Risk_Score"]
-        assert scores.between(0, 1).all()
-    finally:
-        if os.path.exists(result["output_path"]):
-            os.unlink(result["output_path"])
+def test_evidence_ranks_absolute_shap_impact_and_disclaims_causation():
+    row = pd.Series([10.0, 20.0, 30.0], index=["a", "b", "c"])
+    evidence, items = app.make_evidence(row, np.array([0.1, -0.8, 0.4]), ["a", "b", "c"])
+    assert [item["feature"] for item in items] == ["b", "c", "a"]
+    assert "SHAP describes model influence, not causation" in evidence
+    assert "b=20" in evidence
+
+
+def test_safe_text_removes_control_characters_and_limits_length():
+    assert app.safe_text("abc\n\x00def", limit=20) == "abcdef"
+    assert len(app.safe_text("x" * 200, limit=32)) == 32
