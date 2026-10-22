@@ -437,6 +437,7 @@ def main() -> None:
             help="Choose how many rows from the beginning of the uploaded CSV to analyze. Extra columns are automatically removed and missing model features are zero-filled.",
         )
         st.caption("Columns are aligned automatically to the model's 40 features.")
+        suppression_engine = st.sidebar.toggle("🛡️ Enable Anti-Fatigue Suppression", value=True, help="Hide alerts below 90% score and consolidate repeated source-IP / threat-class pairs.")
         if "active_mode" not in st.session_state:
             st.session_state.active_mode = "csv"
         if "current_simulated_row" not in st.session_state:
@@ -663,9 +664,55 @@ def main() -> None:
     alert_tab, ood_tab, ledger_tab = st.tabs(["Threat investigation", "Unknown/OOD anomalies", "SOC incident ledger"])
     with alert_tab:
         candidate_positions = np.flatnonzero(malicious)
-        positions = candidate_positions[np.argsort(np.nan_to_num(confidence[candidate_positions], nan=-1.0))[::-1]][:MAX_ALERTS]
+        # Keep a stable, score-descending copy of all malicious candidates before suppression.
+        score_for_triage = np.where(vault_hit, vault_similarities, confidence).astype(float)
+        score_for_triage = np.nan_to_num(score_for_triage, nan=-1.0, posinf=1.0, neginf=-1.0)
+        original_alerts = candidate_positions[
+            np.argsort(score_for_triage[candidate_positions])[::-1]
+        ]
+        positions = original_alerts.copy()
+        alerts_suppressed = 0
+
+        if suppression_engine and len(original_alerts):
+            # Use the uploaded source-IP column when available. Otherwise, keep rows
+            # distinct rather than accidentally suppressing unrelated events.
+            source_ip_column = next(
+                (column for column in preview_source.columns
+                 if normalize_column(str(column)).lower() in {"source_ip", "src_ip", "sourceip", "srcip"}),
+                None,
+            )
+            seen_alert_keys = set()
+            kept_positions = []
+            for pos in original_alerts:
+                score = float(score_for_triage[pos])
+                if score <= 0.90:
+                    continue
+                if source_ip_column is not None and pos < len(preview_source):
+                    source_ip = str(preview_source.iloc[int(pos)][source_ip_column]).strip()
+                    if not source_ip or source_ip.lower() in {"nan", "none"}:
+                        source_ip = f"row:{int(pos)}"
+                else:
+                    source_ip = f"row:{int(pos)}"
+                threat_class = str(labels[pos])
+                dedupe_key = (source_ip, threat_class)
+                # Already sorted by score: first occurrence is the highest-scoring alert.
+                if dedupe_key in seen_alert_keys:
+                    continue
+                seen_alert_keys.add(dedupe_key)
+                kept_positions.append(int(pos))
+
+            positions = np.asarray(kept_positions, dtype=int)
+            alerts_suppressed = len(original_alerts) - len(positions)
+            st.success(
+                f"Anti-Fatigue Engine Active: Auto-suppressed {alerts_suppressed} redundant or low-confidence alerts."
+            )
+        else:
+            # Suppression disabled: preserve the existing raw top-alert list.
+            positions = original_alerts[:MAX_ALERTS]
+
+        positions = positions[:MAX_ALERTS]
         if not len(positions):
-            st.success("No in-distribution malicious predictions were produced.")
+            st.success("No alerts remain in the triage list under the current suppression settings.")
         else:
             for pos in positions:
                 attack = labels[pos]
