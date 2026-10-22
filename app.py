@@ -218,8 +218,8 @@ def preprocess_network_chunk(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[st
 
 def generate_synthetic_data(n_rows: int = 500, seed: int = 42) -> pd.DataFrame:
     """Create a deterministic 500-row demonstration dataset with binary labels."""
-    if n_rows < 50:
-        raise ValueError("n_rows must be at least 50 for a meaningful synthetic split.")
+    if n_rows < 2:
+        raise ValueError("n_rows must be at least 2 to include both classes.")
     rng = np.random.default_rng(seed)
     labels = np.zeros(n_rows, dtype=np.int32)
     labels[rng.choice(n_rows, n_rows // 2, replace=False)] = 1
