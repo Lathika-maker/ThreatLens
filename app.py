@@ -1,15 +1,18 @@
-"""ThreatLens: evidence-grounded, local network threat triage."""
+"""ThreatLens: local hybrid classical/quantum network-flow triage MVP.
+
+All traffic analysis runs locally. Hugging Face model weights may be downloaded once
+on first launch; set HF_HUB_OFFLINE=1 after caching the encoder to force offline use.
+"""
 from __future__ import annotations
 
+import hashlib
 import io
-import json
 import os
+import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-# Keep the small CPU encoder stable on Apple Silicon and avoid oversized BLAS
-# thread pools in Streamlit's runner process.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -19,609 +22,644 @@ os.environ.setdefault("HF_HOME", str(Path(__file__).parent / ".cache" / "hugging
 import faiss
 import numpy as np
 import pandas as pd
+import pennylane as qml
+import shap
 import streamlit as st
+import xgboost as xgb
 from sentence_transformers import SentenceTransformer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# 1. Constants -----------------------------------------------------------------
-FEATURES = [
-    "Destination_Port", "Flow_Duration", "Total_Fwd_Packets", "Total_Bwd_Packets",
-    "Flow_Bytes_s", "Flow_Packets_s", "Packet_Length_Mean", "SYN_Flag_Count",
-]
-CLASSES = ["BENIGN", "PortScan", "DDoS", "BruteForce", "PrivilegeAnomaly"]
-LOG_FEATURES = {
-    "Flow_Duration", "Flow_Bytes_s", "Flow_Packets_s", "Total_Fwd_Packets",
-    "Total_Bwd_Packets", "SYN_Flag_Count",
-}
-HIGH_PRIORITY_CLASSES = {"DDoS", "BruteForce", "PrivilegeAnomaly"}
+APP_TITLE = "ThreatLens | Hybrid SOC Co-Pilot"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+FEATURES = [
+    "Destination_Port", "Flow_Duration", "Total_Fwd_Packets",
+    "Total_Bwd_Packets", "Flow_Bytes_s", "Packet_Length_Mean", "SYN_Flag_Count",
+]
+LABEL_COLUMN = "Label"
+EDGE_LOW, EDGE_HIGH = 0.40, 0.65
+DEFAULT_CHUNK_SIZE = 50_000
+MAX_ALERT_CARDS = 50
+PREVIEW_ROWS = 500
 
-# 2. Threat intelligence knowledge base ---------------------------------------
-THREAT_INTEL: dict[str, dict[str, Any]] = {
+# A small, curated local knowledge base. It is an illustrative subset of ATT&CK,
+# not a complete or automatically updated ATT&CK corpus.
+MITRE: dict[str, dict[str, Any]] = {
     "T1046": {
         "id": "T1046", "name": "Network Service Discovery", "tactic": "Discovery",
-        "class": "PortScan",
-        "description": "An actor probes hosts and services to identify reachable ports. Repeated short flows with few replies can reveal systematic service discovery.",
-        "impact": "Scanning exposes reachable services and helps an actor plan follow-on activity.",
-        "signature": "many destination ports, tiny flows, one to three forward packets, few backward response packets, low byte rate",
-        "actions": [
-            "Contain: block or rate-limit the scanning source at the network edge.",
-            "Investigate: review probed hosts, exposed services, and follow-on connections.",
-            "Remediate: close unnecessary ports and tune scan detection thresholds.",
+        "description": "An actor probes hosts and network services to identify reachable ports and services.",
+        "mitigations": [
+            "Contain: rate-limit or block the confirmed scanning source at the network boundary.",
+            "Investigate: correlate destination ports, targeted hosts, and follow-on connections.",
+            "Remediate: close unnecessary services and tune network-scan monitoring.",
         ],
     },
     "T1110": {
         "id": "T1110", "name": "Brute Force", "tactic": "Credential Access",
-        "class": "BruteForce",
-        "description": "An actor repeatedly attempts to guess or reuse credentials against a service. Repetitive traffic to remote access ports can indicate password guessing.",
-        "impact": "Successful guessing can expose accounts and provide an initial foothold.",
-        "signature": "repeated login attempts, remote access service, destination port 22, 21, or 3389, recurring small flows",
-        "actions": [
-            "Contain: rate-limit or temporarily block the source on the targeted service.",
-            "Investigate: review authentication logs and targeted accounts for successful logins.",
-            "Remediate: enforce MFA, strong credentials, and account lockout controls.",
+        "description": "An actor repeatedly attempts to guess passwords or otherwise obtain valid credentials.",
+        "mitigations": [
+            "Contain: rate-limit or temporarily block the source against the affected service.",
+            "Investigate: review identity-provider and host authentication logs for successful logins.",
+            "Remediate: enforce MFA, strong credentials, and appropriate lockout controls.",
         ],
     },
     "T1071": {
         "id": "T1071", "name": "Application Layer Protocol", "tactic": "Command and Control",
-        "class": "DDoS",
-        "description": "An actor can use common application protocols to communicate with external systems. Repeated network behavior may blend into ordinary service traffic.",
-        "impact": "Covert communication can enable remote control or data movement.",
-        "signature": "repeated application traffic, outbound communication, regular network flows, recurring destination service",
-        "actions": [
-            "Contain: block confirmed malicious destinations at the network boundary.",
-            "Investigate: inspect DNS, proxy, and endpoint logs for matching communication.",
-            "Remediate: restrict outbound traffic to approved services and destinations.",
+        "description": "An actor uses application protocols to communicate with systems under their control.",
+        "mitigations": [
+            "Contain: block confirmed malicious destinations using approved network controls.",
+            "Investigate: correlate DNS, proxy, firewall, and endpoint telemetry.",
+            "Remediate: restrict outbound access to approved services and destinations.",
         ],
     },
     "T1499": {
         "id": "T1499", "name": "Endpoint Denial of Service", "tactic": "Impact",
-        "class": "DDoS",
-        "description": "An actor exhausts an endpoint or service through excessive requests or resource use. A flood of short, high-rate flows with few replies is a common signal.",
-        "impact": "The target service may become slow or unavailable to legitimate users.",
-        "signature": "high packet rate, many SYN flags, very short flows, no backward response packets, flood of small packets to a single port, denial of service",
-        "actions": [
-            "Contain: apply upstream rate limits or filtering to the targeted service.",
-            "Investigate: check service health and preserve traffic and system evidence.",
-            "Remediate: tune capacity, firewall rules, and DDoS protections for the endpoint.",
+        "description": "An actor attempts to exhaust endpoint or service resources so legitimate users are disrupted.",
+        "mitigations": [
+            "Contain: apply validated rate limits or upstream filtering to the affected service.",
+            "Investigate: review packet rates, service health, and related system logs.",
+            "Remediate: tune capacity, filtering, and denial-of-service protections.",
         ],
     },
     "T1190": {
         "id": "T1190", "name": "Exploit Public-Facing Application", "tactic": "Initial Access",
-        "class": "PortScan",
-        "description": "An actor may exploit a weakness in an application exposed to the internet. Suspicious probing of web services can precede exploitation attempts.",
-        "impact": "Successful exploitation may provide access to a host or its data.",
-        "signature": "web service probing, repeated requests, public-facing application, destination ports 80 or 443, unusual response pattern",
-        "actions": [
-            "Contain: temporarily restrict suspicious sources from the exposed service.",
-            "Investigate: review web, application, and host logs for exploit indicators.",
-            "Remediate: patch the application and remove unnecessary public exposure.",
+        "description": "An actor may exploit a vulnerability in an internet-facing application to gain access.",
+        "mitigations": [
+            "Contain: restrict suspicious sources where operationally safe.",
+            "Investigate: inspect web, application, and host logs for exploit indicators.",
+            "Remediate: patch the exposed application and reduce unnecessary public exposure.",
         ],
     },
     "T1078": {
-        "id": "T1078", "name": "Valid Accounts",
-        "tactic": "Defense Evasion, Persistence, Privilege Escalation, Initial Access",
-        "class": "PrivilegeAnomaly",
-        "description": "An actor may use legitimate credentials to access systems and evade simple controls. Unusual traffic to administrative services can add supporting context.",
-        "impact": "Misused accounts can enable persistent access and privileged actions.",
-        "signature": "unusual administrative access, destination ports 445, 3389, or 389, longer two-way flows, valid account activity",
-        "actions": [
-            "Contain: disable or restrict the account when misuse is suspected.",
-            "Investigate: audit sign-ins, privileges, and affected hosts for unauthorized actions.",
-            "Remediate: rotate credentials and require MFA on privileged accounts.",
+        "id": "T1078", "name": "Valid Accounts", "tactic": "Defense Evasion / Persistence / Privilege Escalation / Initial Access",
+        "description": "An actor uses legitimate account credentials to access systems and blend in with normal activity.",
+        "mitigations": [
+            "Contain: restrict or disable an account when misuse is substantiated.",
+            "Investigate: audit sign-ins, privilege changes, and affected systems.",
+            "Remediate: rotate credentials and require MFA for privileged accounts.",
         ],
     },
 }
-CLASS_TO_TECHNIQUE = {
-    "PortScan": "T1046", "BruteForce": "T1110", "DDoS": "T1499",
-    "PrivilegeAnomaly": "T1078",
+
+# Normalize popular CICIDS2017, common NetFlow, and Zeek field names.
+ALIASES = {
+    "destinationport": "Destination_Port", "dstport": "Destination_Port",
+    "dst_port": "Destination_Port", "dest_port": "Destination_Port",
+    "flowduration": "Flow_Duration", "duration": "Flow_Duration",
+    "totalfwdpackets": "Total_Fwd_Packets", "tot_fwd_pkts": "Total_Fwd_Packets",
+    "fwd_packets": "Total_Fwd_Packets", "forward_packets": "Total_Fwd_Packets",
+    "totalbackwardpackets": "Total_Bwd_Packets", "total_bwd_pkts": "Total_Bwd_Packets",
+    "tot_bwd_pkts": "Total_Bwd_Packets", "bwd_packets": "Total_Bwd_Packets",
+    "flowbytes_s": "Flow_Bytes_s", "flow_bytes_sec": "Flow_Bytes_s",
+    "flow_bytes_per_s": "Flow_Bytes_s", "bytes_per_second": "Flow_Bytes_s",
+    "avg_packet_length": "Packet_Length_Mean", "average_packet_size": "Packet_Length_Mean",
+    "packet_length_mean": "Packet_Length_Mean", "avg_pkt_size": "Packet_Length_Mean",
+    "syn_flag_count": "SYN_Flag_Count", "syn_count": "SYN_Flag_Count",
+    "src_ip": "Source_IP", "source_ip": "Source_IP", "id_orig_h": "Source_IP",
+    "dst_ip": "Dest_IP", "dest_ip": "Dest_IP", "destination_ip": "Dest_IP", "id_resp_h": "Dest_IP",
+    "flow_id": "Flow_ID", "label": "Label", "class": "Label", "attack": "Label",
+    "total_len_fwd_pkts": "Total_Length_Fwd_Packets",
+    "total_len_bwd_pkts": "Total_Length_Bwd_Packets",
+    "totlen_fwd_pkts": "Total_Length_Fwd_Packets",
+    "totlen_bwd_pkts": "Total_Length_Bwd_Packets",
+    "fwd_pkt_len_mean": "Fwd_Packet_Length_Mean",
+    "bwd_pkt_len_mean": "Bwd_Packet_Length_Mean",
 }
 
 
-def technique_text(technique: dict[str, Any]) -> str:
-    """Return the stable text used to embed a knowledge-base entry."""
-    return " ".join(technique[key] for key in ("name", "tactic", "description", "signature"))
+def _normal_name(name: Any) -> str:
+    import re
+    value = str(name).strip().replace("\ufeff", "")
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    value = re.sub(r"[/\s.\-]+", "_", value).strip("_").lower()
+    compact = value.replace("_", "")
+    if compact in ALIASES:
+        return ALIASES[compact]
+    if value in ALIASES:
+        return ALIASES[value]
+    return ALIASES.get(value, str(name).strip().replace(" ", "_"))
 
 
-# 3. Synthetic data and cached resources --------------------------------------
-def _sample_range(rng: np.random.Generator, bounds: tuple[float, float], size: int,
-                  log_uniform: bool = False) -> np.ndarray:
-    if log_uniform:
-        return np.exp(rng.uniform(np.log(bounds[0]), np.log(bounds[1]), size))
-    return rng.uniform(bounds[0], bounds[1], size)
+def normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Map recognizable field aliases to the canonical names consumed by the model."""
+    out = frame.copy()
+    out.columns = [_normal_name(column) for column in out.columns]
+    return out.loc[:, ~out.columns.duplicated()]
 
 
-def generate_flows(n_per_class: int = 1500, seed: int = 42) -> pd.DataFrame:
-    """Generate repeatable CICIDS-style records with five percent profile noise."""
-    rng = np.random.default_rng(seed)
-    specs: dict[str, dict[str, Any]] = {
-        "BENIGN": {"n": max(2500, n_per_class), "ports": [80, 443, 53, 8080], "duration": (1e5, 1e7), "fwd": (5, 60), "bwd": (5, 80), "bytes": (1e3, 1e6), "length": (200, 900), "syn": (1, 2)},
-        "PortScan": {"n": n_per_class, "ports": None, "duration": (1, 5e3), "fwd": (1, 3), "bwd": (0, 1), "bytes": (1, 5e3), "length": (0, 60), "syn": (1, 1)},
-        "DDoS": {"n": n_per_class, "ports": [80, 443], "duration": (10, 5e4), "fwd": (100, 5000), "bwd": (0, 2), "bytes": (1e7, 1e9), "length": (40, 120), "syn": (50, 500)},
-        "BruteForce": {"n": n_per_class, "ports": [21, 22, 3389], "duration": (1e5, 1e6), "fwd": (10, 30), "bwd": (10, 30), "bytes": (1e3, 5e5), "length": (60, 200), "syn": (1, 3)},
-        "PrivilegeAnomaly": {"n": n_per_class, "ports": [389, 445, 3389], "duration": (1e5, 5e6), "fwd": (20, 100), "bwd": (20, 100), "bytes": (1e3, 8e5), "length": (300, 1200), "syn": (1, 2)},
-    }
-    parts: list[pd.DataFrame] = []
-    for label, spec in specs.items():
-        count = int(spec["n"])
-        ports = (rng.choice(spec["ports"], count) if spec["ports"] else
-                 rng.integers(1, 65536, count))
-        duration = _sample_range(rng, spec["duration"], count, log_uniform=True)
-        fwd = rng.integers(spec["fwd"][0], spec["fwd"][1] + 1, count)
-        bwd = rng.integers(spec["bwd"][0], spec["bwd"][1] + 1, count)
-        byte_rate = _sample_range(rng, spec["bytes"], count, log_uniform=True)
-        frame = pd.DataFrame({
-            "Destination_Port": ports,
-            "Flow_Duration": duration,
-            "Total_Fwd_Packets": fwd,
-            "Total_Bwd_Packets": bwd,
-            "Flow_Bytes_s": byte_rate,
-            "Flow_Packets_s": (fwd + bwd) / np.maximum(duration / 1e6, 1e-9),
-            "Packet_Length_Mean": _sample_range(rng, spec["length"], count),
-            "SYN_Flag_Count": rng.integers(spec["syn"][0], spec["syn"][1] + 1, count),
-            "Label": label,
-        })
-        frame.insert(0, "Flow_ID", [f"F-{label}-{i:06d}" for i in range(count)])
-        frame.insert(1, "Source_IP", [f"10.{rng.integers(0, 256)}.{rng.integers(0, 256)}.{rng.integers(1, 255)}" for _ in range(count)])
-        frame.insert(2, "Dest_IP", [f"192.168.{rng.integers(0, 256)}.{rng.integers(1, 255)}" for _ in range(count)])
-        parts.append(frame)
+def preprocess_network_chunk(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Standardize a chunk, derive supported rates, and disclose missing/imputed features.
 
-    data = pd.concat(parts, ignore_index=True)
-    # Five percent of rows borrow selected measurements from a different class;
-    # labels stay attached to the source class so the demo includes realistic overlap.
-    feature_cols = ["Destination_Port", "Flow_Duration", "Total_Fwd_Packets",
-                    "Total_Bwd_Packets", "Flow_Bytes_s", "Packet_Length_Mean", "SYN_Flag_Count"]
-    for label in CLASSES:
-        indexes = data.index[data["Label"] == label].to_numpy()
-        noise_n = int(round(len(indexes) * 0.05))
-        if not noise_n:
+    Flow duration derivation assumes microseconds, as used by CICIDS-style exports.
+    A dataset with other units should be normalized by the user before analysis.
+    """
+    out = normalize_columns(frame)
+    derived: dict[str, int] = {}
+
+    # Derive mean packet size from directional means if supplied.
+    if "Packet_Length_Mean" not in out and {
+        "Fwd_Packet_Length_Mean", "Bwd_Packet_Length_Mean"
+    }.issubset(out.columns):
+        out["Packet_Length_Mean"] = (
+            pd.to_numeric(out["Fwd_Packet_Length_Mean"], errors="coerce")
+            + pd.to_numeric(out["Bwd_Packet_Length_Mean"], errors="coerce")
+        ) / 2.0
+        derived["Packet_Length_Mean"] = int(out["Packet_Length_Mean"].notna().sum())
+
+    # A total byte rate can be derived from directional byte counts and duration.
+    if "Flow_Bytes_s" not in out and {
+        "Total_Length_Fwd_Packets", "Total_Length_Bwd_Packets", "Flow_Duration"
+    }.issubset(out.columns):
+        seconds = pd.to_numeric(out["Flow_Duration"], errors="coerce") / 1_000_000.0
+        total_bytes = (
+            pd.to_numeric(out["Total_Length_Fwd_Packets"], errors="coerce")
+            + pd.to_numeric(out["Total_Length_Bwd_Packets"], errors="coerce")
+        )
+        out["Flow_Bytes_s"] = total_bytes / seconds.where(seconds > 0)
+        derived["Flow_Bytes_s"] = int(out["Flow_Bytes_s"].notna().sum())
+
+    # Preserve what was unavailable before imputation, rather than hiding it.
+    missing_features = [feature for feature in FEATURES if feature not in out.columns]
+    invalid_cell_count = 0
+    for feature in FEATURES:
+        if feature not in out.columns:
+            out[feature] = 0.0
             continue
-        targets = rng.choice(indexes, noise_n, replace=False)
-        others = data.index[data["Label"] != label].to_numpy()
-        sources = rng.choice(others, noise_n, replace=True)
-        data.loc[targets, feature_cols] = data.loc[sources, feature_cols].to_numpy()
-    data["Flow_Packets_s"] = (data["Total_Fwd_Packets"] + data["Total_Bwd_Packets"]) / np.maximum(data["Flow_Duration"] / 1e6, 1e-9)
-    return data.iloc[rng.permutation(len(data))].reset_index(drop=True)
+        values = pd.to_numeric(out[feature], errors="coerce")
+        invalid_cell_count += int((~np.isfinite(values.to_numpy(dtype=float, na_value=np.nan))).sum())
+        out[feature] = values.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if "Flow_ID" not in out:
+        out.insert(0, "Flow_ID", [f"CSV-{i + 1:08d}" for i in range(len(out))])
+    if "Source_IP" not in out:
+        out["Source_IP"] = "Unknown"
+    if "Dest_IP" not in out:
+        out["Dest_IP"] = "Unknown"
+
+    warnings = []
+    if missing_features:
+        warnings.append("Missing feature columns filled with zero: " + ", ".join(missing_features))
+    if invalid_cell_count:
+        warnings.append(f"{invalid_cell_count} non-numeric/non-finite values replaced with zero")
+    out["Preprocessing_Warning"] = "; ".join(warnings) if warnings else "None"
+    report = {
+        "rows": int(len(out)),
+        "missing_features": missing_features,
+        "invalid_numeric_cells_replaced_with_zero": invalid_cell_count,
+        "derived_features": derived,
+        "warning": "; ".join(warnings) if warnings else "None",
+    }
+    return out, report
+
+
+def generate_synthetic_data(n_rows: int = 500, seed: int = 42) -> pd.DataFrame:
+    """Create a deterministic 500-row demonstration dataset with binary labels."""
+    if n_rows < 50:
+        raise ValueError("n_rows must be at least 50 for a meaningful synthetic split.")
+    rng = np.random.default_rng(seed)
+    labels = np.zeros(n_rows, dtype=np.int32)
+    labels[rng.choice(n_rows, n_rows // 2, replace=False)] = 1
+    benign_n = int((labels == 0).sum())
+    malicious_n = n_rows - benign_n
+    benign = pd.DataFrame({
+        "Destination_Port": rng.choice([53, 80, 443, 8080, 123], benign_n),
+        "Flow_Duration": np.exp(rng.uniform(np.log(100_000), np.log(10_000_000), benign_n)),
+        "Total_Fwd_Packets": rng.integers(5, 80, benign_n),
+        "Total_Bwd_Packets": rng.integers(3, 100, benign_n),
+        "Flow_Bytes_s": np.exp(rng.uniform(np.log(1_000), np.log(2_000_000), benign_n)),
+        "Packet_Length_Mean": rng.uniform(180, 900, benign_n),
+        "SYN_Flag_Count": rng.integers(0, 5, benign_n),
+        "Label": 0,
+    })
+    attack_kind = rng.integers(0, 4, malicious_n)
+    malicious = pd.DataFrame({
+        "Destination_Port": np.where(attack_kind == 0, rng.integers(1, 65536, malicious_n),
+                             np.where(attack_kind == 1, rng.choice([80, 443], malicious_n),
+                             np.where(attack_kind == 2, rng.choice([21, 22, 3389], malicious_n),
+                                      rng.choice([389, 445, 3389], malicious_n)))),
+        "Flow_Duration": np.where(attack_kind == 0, np.exp(rng.uniform(np.log(1), np.log(5_000), malicious_n)),
+                          np.where(attack_kind == 1, np.exp(rng.uniform(np.log(10), np.log(50_000), malicious_n)),
+                          np.exp(rng.uniform(np.log(30_000), np.log(2_000_000), malicious_n)))),
+        "Total_Fwd_Packets": np.where(attack_kind == 1, rng.integers(100, 5_000, malicious_n),
+                                      rng.integers(1, 50, malicious_n)),
+        "Total_Bwd_Packets": np.where(attack_kind == 1, rng.integers(0, 3, malicious_n),
+                                      rng.integers(0, 40, malicious_n)),
+        "Flow_Bytes_s": np.where(attack_kind == 1, np.exp(rng.uniform(np.log(1e6), np.log(1e9), malicious_n)),
+                                 np.exp(rng.uniform(np.log(10), np.log(1e6), malicious_n))),
+        "Packet_Length_Mean": np.where(attack_kind == 1, rng.uniform(40, 150, malicious_n),
+                                       rng.uniform(30, 500, malicious_n)),
+        "SYN_Flag_Count": np.where(attack_kind == 1, rng.integers(30, 600, malicious_n),
+                                   rng.integers(0, 15, malicious_n)),
+        "Label": 1,
+    })
+    data = pd.concat([benign, malicious], ignore_index=True)
+    data = data.iloc[rng.permutation(len(data))].reset_index(drop=True)
+    data.insert(0, "Flow_ID", [f"SYN-{i + 1:05d}" for i in range(len(data))])
+    data.insert(1, "Source_IP", [f"10.{rng.integers(0, 256)}.{rng.integers(0, 256)}.{rng.integers(1, 255)}" for _ in range(len(data))])
+    data.insert(2, "Dest_IP", [f"192.168.{rng.integers(0, 256)}.{rng.integers(1, 255)}" for _ in range(len(data))])
+    return data
+
+
+@st.cache_resource(show_spinner=False)
+def train_model() -> dict[str, Any]:
+    """Train XGBoost on the fixed 500-row generated benchmark; never on upload labels."""
+    data = generate_synthetic_data()
+    x = data[FEATURES].astype(float)
+    y = data["Label"].astype(int)
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=0.25, random_state=42, stratify=y
+    )
+    model = xgb.XGBClassifier(
+        n_estimators=120, max_depth=4, learning_rate=0.06,
+        subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+        objective="binary:logistic", eval_metric="logloss",
+        random_state=42, n_jobs=2, verbosity=0,
+    )
+    model.fit(x_train, y_train)
+    predictions = model.predict(x_test)
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, predictions)),
+        "precision": float(precision_score(y_test, predictions, zero_division=0)),
+        "recall": float(recall_score(y_test, predictions, zero_division=0)),
+        "f1": float(f1_score(y_test, predictions, zero_division=0)),
+        "test_rows": int(len(y_test)),
+    }
+    return {"model": model, "metrics": metrics, "train_min": x_train.min(), "train_max": x_train.max()}
 
 
 @st.cache_resource(show_spinner=False)
 def load_embedder() -> SentenceTransformer:
-    """Load the local MiniLM encoder; HF_HUB_OFFLINE=1 is honored by HF Hub."""
-    repository = Path(os.environ["HF_HOME"]) / "hub" / "models--sentence-transformers--all-MiniLM-L6-v2"
-    snapshots = repository / "snapshots"
-    cached = snapshots.is_dir() and any((snapshot / "modules.json").is_file() for snapshot in snapshots.iterdir())
-    if cached:
+    """Load MiniLM on CPU; use local cache automatically when it exists."""
+    hub = Path(os.environ["HF_HOME"]) / "hub" / "models--sentence-transformers--all-MiniLM-L6-v2"
+    snapshots = hub / "snapshots"
+    is_cached = snapshots.is_dir() and any((path / "modules.json").exists() for path in snapshots.iterdir())
+    if is_cached:
         return SentenceTransformer(MODEL_NAME, device="cpu", local_files_only=True)
     return SentenceTransformer(MODEL_NAME, device="cpu")
 
 
 @st.cache_resource(show_spinner=False)
-def build_vector_index() -> tuple[faiss.IndexFlatL2, list[str]]:
-    """Build one cached 384-dimensional FAISS index for the six techniques."""
-    ordered_ids = list(THREAT_INTEL)
-    vectors = load_embedder().encode(
-        [technique_text(THREAT_INTEL[technique_id]) for technique_id in ordered_ids],
-        convert_to_numpy=True,
-    ).astype(np.float32)
-    if vectors.shape != (len(ordered_ids), 384):
-        raise ValueError(f"Expected 6 embeddings of dimension 384; got {vectors.shape}.")
-    index = faiss.IndexFlatL2(384)
+def build_faiss_index() -> tuple[faiss.IndexFlatL2, list[str]]:
+    """Embed the six local ATT&CK entries and store 384-D vectors in FAISS."""
+    ids = list(MITRE)
+    texts = [
+        f"{entry['id']} {entry['name']} {entry['tactic']} {entry['description']} "
+        + " ".join(entry["mitigations"])
+        for entry in MITRE.values()
+    ]
+    vectors = load_embedder().encode(texts, convert_to_numpy=True).astype(np.float32)
+    if vectors.shape != (len(ids), 384):
+        raise ValueError(f"Expected embeddings shaped (6, 384), received {vectors.shape}.")
+    index = faiss.IndexFlatL2(vectors.shape[1])
     index.add(vectors)
-    return index, ordered_ids
-
-
-def _model_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    """Create model input from the fixed feature list only."""
-    return (frame.loc[:, FEATURES].apply(pd.to_numeric, errors="coerce")
-            .replace([np.inf, -np.inf], np.nan).fillna(0).astype(float))
-
-
-def _baseline_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    values = _model_matrix(frame)
-    values.loc[:, list(LOG_FEATURES)] = np.log1p(values[list(LOG_FEATURES)].clip(lower=0))
-    return values
+    return index, ids
 
 
 @st.cache_resource(show_spinner=False)
-def train_model() -> dict[str, Any]:
-    """Train a deterministic Random Forest and its benign reference baseline."""
-    data = generate_flows()
-    x = _model_matrix(data)
-    x_train, x_test, y_train, y_test = train_test_split(
-        x, data["Label"], test_size=0.25, stratify=data["Label"], random_state=42,
+def build_shap_explainer() -> shap.TreeExplainer:
+    """Cache TreeExplainer over the trained local XGBoost model."""
+    return shap.TreeExplainer(train_model()["model"])
+
+
+def predict_chunk(frame: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
+    """Classify one preprocessed chunk; Label is never passed to the model."""
+    out = frame.copy()
+    x = out[FEATURES].astype(np.float32)
+    probabilities = bundle["model"].predict_proba(x)[:, 1]
+    out["Threat_Probability"] = probabilities
+    out["Prediction"] = (probabilities >= 0.5).astype(np.int8)
+    out["Prediction_Label"] = np.where(out["Prediction"] == 1, "MALICIOUS", "BENIGN")
+    out["Priority"] = np.where((probabilities >= 0.90) & (out["Prediction"] == 1), "HIGH",
+                               np.where(out["Prediction"] == 1, "MEDIUM", "—"))
+    out["Quantum_Routed"] = (probabilities >= EDGE_LOW) & (probabilities <= EDGE_HIGH)
+    return out
+
+
+def _shap_vector(row: pd.Series, bundle: dict[str, Any]) -> np.ndarray:
+    """Return a positive-class SHAP vector robust to supported SHAP output shapes."""
+    values = build_shap_explainer().shap_values(row[FEATURES].astype(float).to_frame().T)
+    if isinstance(values, list):
+        values = values[1] if len(values) > 1 else values[0]
+    array = np.asarray(values)
+    if array.ndim == 3:
+        array = array[0, :, min(1, array.shape[-1] - 1)]
+    elif array.ndim == 2:
+        array = array[0]
+    return np.asarray(array, dtype=float).reshape(-1)
+
+
+def explain_flow(row: pd.Series, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return top-three SHAP feature evidence for a single analyzed network flow."""
+    values = _shap_vector(row, bundle)
+    positions = np.argsort(np.abs(values))[::-1][:3]
+    return [
+        {"feature": FEATURES[int(i)], "shap_value": float(values[int(i)]),
+         "absolute_shap": float(abs(values[int(i)])), "feature_value": float(row[FEATURES[int(i)]])}
+        for i in positions
+    ]
+
+
+# PennyLane VQC: a simulation-based edge-case signal, not a calibrated probability.
+_QUANTUM_DEVICE = qml.device("default.qubit", wires=4)
+
+
+@qml.qnode(_QUANTUM_DEVICE)
+def _quantum_circuit(inputs: Any, weights: Any) -> Any:
+    qml.AngleEmbedding(inputs, wires=range(4), rotation="Y")
+    for wire in range(4):
+        qml.RY(weights[wire, 0], wires=wire)
+        qml.RZ(weights[wire, 1], wires=wire)
+    qml.CNOT(wires=[0, 1])
+    qml.CNOT(wires=[1, 2])
+    qml.CNOT(wires=[2, 3])
+    qml.CNOT(wires=[3, 0])
+    return qml.expval(qml.PauliZ(0))
+
+
+def quantum_risk_score(row: pd.Series, bundle: dict[str, Any]) -> float:
+    """Run the four-qubit circuit for ambiguous classifier scores only."""
+    raw = row[FEATURES].astype(float).to_numpy()
+    low = bundle["train_min"].to_numpy(dtype=float)
+    high = bundle["train_max"].to_numpy(dtype=float)
+    scaled = np.clip((raw - low) / np.maximum(high - low, 1e-9), 0.0, 1.0) * np.pi
+    angles = scaled[:4]
+    weights = np.array([[0.31, 0.18], [0.23, 0.27], [0.14, 0.37], [0.41, 0.12]], dtype=float)
+    expectation = float(_quantum_circuit(angles, weights))
+    return float(np.clip((expectation + 1.0) / 2.0, 0.0, 1.0))
+
+
+def retrieve_mitre(row: pd.Series, evidence: list[dict[str, Any]],
+                    index: faiss.IndexFlatL2, ids: list[str],
+                    embedder: SentenceTransformer) -> dict[str, Any]:
+    """Find relevant local ATT&CK text using a flow-and-evidence query."""
+    features_text = ", ".join(
+        f"{item['feature']}={item['feature_value']:.4g} (SHAP={item['shap_value']:+.4g})"
+        for item in evidence
     )
-    model = RandomForestClassifier(
-        n_estimators=100, max_depth=12, random_state=42, n_jobs=-1,
+    query = (
+        f"Network security flow destination port {int(row['Destination_Port'])}; "
+        f"duration {row['Flow_Duration']:.4g}; forward packets {row['Total_Fwd_Packets']:.4g}; "
+        f"backward packets {row['Total_Bwd_Packets']:.4g}; bytes per second {row['Flow_Bytes_s']:.4g}; "
+        f"mean packet length {row['Packet_Length_Mean']:.4g}; SYN flags {row['SYN_Flag_Count']:.4g}. "
+        f"Classifier marked {row['Prediction_Label']} with score {row['Threat_Probability']:.3f}. "
+        f"Important model features: {features_text}."
     )
-    model.fit(x_train, y_train)
-    prediction = model.predict(x_test)
-    benign = _baseline_matrix(x_train.loc[y_train == "BENIGN"])
-    baseline = {
-        "mean": benign.mean(),
-        "std": benign.std(ddof=0).replace(0, 1e-9),
-        "raw_mean": _model_matrix(x_train.loc[y_train == "BENIGN"]).mean(),
-    }
-    return {
-        "model": model,
-        "baseline": baseline,
-        "importances": pd.Series(model.feature_importances_, index=FEATURES),
-        "accuracy": float(accuracy_score(y_test, prediction)),
-        "classification_report": classification_report(y_test, prediction, labels=CLASSES, zero_division=0),
-    }
-
-
-# 4. Ingestion ---------------------------------------------------------------
-def normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    """Normalize CICIDS and common flow-field aliases to canonical names."""
-    normalized = frame.copy()
-    normalized.columns = [str(column).strip().replace(" ", "_") for column in normalized.columns]
-    aliases = {
-        "Flow_Bytes/s": "Flow_Bytes_s", "Flow_Bytes_sec": "Flow_Bytes_s",
-        "Flow_Packets/s": "Flow_Packets_s", "Flow_Packets_sec": "Flow_Packets_s",
-        "Total_Fwd_Packets": "Total_Fwd_Packets", "Total_Fwd_Packets_": "Total_Fwd_Packets",
-        "Total_Bwd_Packets": "Total_Bwd_Packets", "Dst_Port": "Destination_Port",
-        "Destination_Port": "Destination_Port", "DstPort": "Destination_Port",
-    }
-    normalized = normalized.rename(columns=aliases)
-    return normalized.loc[:, ~normalized.columns.duplicated()]
-
-
-def prepare_uploaded_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame | None, list[str]]:
-    """Normalize and validate a tabular upload without raising for user errors."""
-    normalized = normalize_columns(frame)
-    missing = [feature for feature in FEATURES if feature not in normalized.columns]
-    if missing:
-        return None, missing
-    for column in FEATURES:
-        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
-    normalized[FEATURES] = normalized[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0)
-    if "Flow_ID" not in normalized:
-        normalized.insert(0, "Flow_ID", [f"UPLOAD-{i + 1:06d}" for i in range(len(normalized))])
-    if "Source_IP" not in normalized:
-        normalized["Source_IP"] = "Unknown"
-    if "Dest_IP" not in normalized:
-        normalized["Dest_IP"] = "Unknown"
-    return normalized, []
-
-
-def load_uploaded_csv(file: Any) -> pd.DataFrame | None:
-    """Read, normalize, and validate an uploaded CSV; report issues in Streamlit."""
-    try:
-        content = file.getvalue() if hasattr(file, "getvalue") else file.read()
-        if isinstance(content, str):
-            content = content.encode("utf-8")
-        if not content:
-            st.error("The selected CSV is empty.")
-            return None
-        frame = pd.read_csv(io.BytesIO(content))
-    except Exception as exc:
-        st.error(f"Could not read the uploaded CSV: {exc}")
-        return None
-    if frame.empty:
-        st.error("The selected CSV has no data rows.")
-        return None
-    cleaned, missing = prepare_uploaded_frame(frame)
-    if missing:
-        st.error("CSV is missing required feature columns: " + ", ".join(missing))
-        return None
-    return cleaned
-
-
-# 5. Detection ---------------------------------------------------------------
-def predict_flows(frame: pd.DataFrame, bundle: dict[str, Any] | None = None) -> pd.DataFrame:
-    """Predict labels and confidence using only FEATURES as model inputs."""
-    bundle = bundle or train_model()
-    x = _model_matrix(frame)
-    model = bundle["model"]
-    probabilities = model.predict_proba(x)
-    result = frame.copy()
-    result["Predicted"] = model.predict(x)
-    result["Confidence"] = probabilities.max(axis=1) * 100
-    result["Is_Malicious"] = result["Predicted"].ne("BENIGN")
-    return result
-
-
-# 6. Explainability ----------------------------------------------------------
-def _transformed_value(feature: str, value: float) -> float:
-    return float(np.log1p(max(value, 0))) if feature in LOG_FEATURES else float(value)
-
-
-def explain_flow(flow: pd.Series | dict[str, Any], bundle: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return stable top-three local evidence shares with benign baselines."""
-    baseline = bundle["baseline"]
-    scores: list[dict[str, Any]] = []
-    for feature in FEATURES:
-        value = float(pd.to_numeric(pd.Series([flow[feature]]), errors="coerce").fillna(0).iloc[0])
-        transformed = _transformed_value(feature, value)
-        mean = float(baseline["mean"][feature])
-        std = max(float(baseline["std"][feature]), 1e-9)
-        z_score = min(abs(transformed - mean) / (std + 1e-9), 10.0)
-        score = float(bundle["importances"][feature]) * z_score
-        raw_baseline = float(baseline["raw_mean"][feature])
-        ratio = value / (raw_baseline + 1e-9) if raw_baseline >= 0 else value / (abs(raw_baseline) + 1e-9)
-        scores.append({
-            "feature": feature, "value": value, "baseline": raw_baseline,
-            "ratio": ratio, "direction": "above" if transformed >= mean else "below",
-            "score": score,
-        })
-    top = sorted(scores, key=lambda item: (-item["score"], FEATURES.index(item["feature"])))[:3]
-    total = sum(item["score"] for item in top)
-    for item in top:
-        item["share"] = (100.0 * item["score"] / total) if total else (100.0 / len(top))
-    if top:
-        top[-1]["share"] += 100.0 - sum(item["share"] for item in top)
-    return [{key: value for key, value in item.items() if key != "score"} for item in top]
-
-
-# 7. Retrieval ---------------------------------------------------------------
-def _behavior_phrase(feature: str, direction: str, port: int) -> str:
-    if feature == "Destination_Port" and port in {21, 22, 3389}:
-        return "repeated login attempts on remote access service"
-    phrases = {
-        ("SYN_Flag_Count", "above"): "many SYN flags",
-        ("Flow_Packets_s", "above"): "high packet rate flood",
-        ("Flow_Bytes_s", "above"): "high byte rate traffic",
-        ("Total_Fwd_Packets", "above"): "many forward packets",
-        ("Total_Bwd_Packets", "below"): "no response packets",
-        ("Flow_Duration", "below"): "very short flows",
-        ("Destination_Port", "above"): "scanning many destination ports",
-        ("Destination_Port", "below"): "traffic to a small set of ports",
-    }
-    return phrases.get((feature, direction), f"{feature.replace('_', ' ').lower()} {direction} baseline")
-
-
-def build_query(pred_class: str, evidence: list[dict[str, Any]], port: int | None = None) -> str:
-    """Build a classifier-grounded query in network behavior language."""
-    prefixes = {
-        "PortScan": "port scan reconnaissance: scanning many ports",
-        "DDoS": "denial of service SYN flood: high packet rate flood",
-        "BruteForce": "credential brute force: repeated login attempts on remote access service",
-        "PrivilegeAnomaly": "unusual valid account administrative access",
-    }
-    port = int(port or 0)
-    phrases = [_behavior_phrase(item["feature"], item["direction"], port) for item in evidence]
-    return f"{prefixes.get(pred_class, pred_class.lower())}: " + ", ".join(phrases)
-
-
-def retrieve_technique(pred_class: str, evidence: list[dict[str, Any]],
-                       index: faiss.IndexFlatL2 | None = None,
-                       ordered_ids: list[str] | None = None,
-                       embedder: SentenceTransformer | None = None,
-                       port: int | None = None) -> dict[str, Any]:
-    """Retrieve nearest technique and expose classifier mapping as primary when known.
-
-    The classifier owns the class decision. If nearest-neighbor retrieval disagrees,
-    its ID and distance remain visible as supporting evidence, while the stable class
-    mapping is used as the primary report technique to prevent semantic drift.
-    """
-    if index is None or ordered_ids is None:
-        index, ordered_ids = build_vector_index()
-    if embedder is None:
-        embedder = load_embedder()
-    query = build_query(pred_class, evidence, port)
     vector = embedder.encode([query], convert_to_numpy=True).astype(np.float32)
     distances, positions = index.search(vector, 1)
-    retrieved_id = ordered_ids[int(positions[0][0])]
-    distance = float(distances[0][0])
-    primary_id = CLASS_TO_TECHNIQUE.get(pred_class, retrieved_id)
+    technique_id = ids[int(positions[0, 0])]
+    return {"query": query, "technique": MITRE[technique_id],
+            "retrieved_id": technique_id, "distance": float(distances[0, 0])}
+
+
+def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
+                          chunk_size: int = DEFAULT_CHUNK_SIZE,
+                          progress: Any | None = None) -> dict[str, Any]:
+    """Analyze large CSVs chunk-by-chunk and stream full results to a local temp CSV.
+
+    Only a 500-row preview and the highest-scoring 200 candidate alerts remain in
+    memory. The uploaded CSV is never sent to a remote service. The output file is
+    local to this Python process and must be treated as sensitive telemetry.
+    """
+    if hasattr(source, "seek"):
+        source.seek(0)
+    output = tempfile.NamedTemporaryFile(prefix="threatlens_", suffix=".csv", delete=False)
+    output_path = output.name
+    output.close()
+    preview_parts: list[pd.DataFrame] = []
+    alert_candidates = pd.DataFrame()
+    total_rows = malicious_rows = high_rows = routed_rows = processed = 0
+    source_name = getattr(source, "name", "network.csv")
+    digest = hashlib.sha256()
+    # Rewind after each chunk reader; Pandas manages streaming CSV parsing.
+    try:
+        chunks = pd.read_csv(source, chunksize=max(1, int(chunk_size)), low_memory=False)
+        first_write = True
+        with open(output_path, "w", encoding="utf-8", newline="") as result_file:
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                cleaned, prep = preprocess_network_chunk(chunk)
+                predicted = predict_chunk(cleaned, bundle)
+                total_rows += len(predicted)
+                malicious_rows += int(predicted["Prediction"].sum())
+                high_rows += int((predicted["Priority"] == "HIGH").sum())
+                routed_rows += int(predicted["Quantum_Routed"].sum())
+                if len(pd.concat(preview_parts, ignore_index=True)) < PREVIEW_ROWS:
+                    remaining = PREVIEW_ROWS - sum(len(part) for part in preview_parts)
+                    preview_parts.append(predicted.head(remaining).copy())
+                candidates = predicted.loc[predicted["Prediction"] == 1].nlargest(
+                    200, "Threat_Probability"
+                )
+                if not candidates.empty:
+                    alert_candidates = pd.concat([alert_candidates, candidates], ignore_index=True)
+                    alert_candidates = alert_candidates.nlargest(200, "Threat_Probability").reset_index(drop=True)
+                predicted.to_csv(result_file, index=False, header=first_write)
+                first_write = False
+                processed += len(predicted)
+                if progress is not None:
+                    progress(min(0.99, processed / (processed + max(1, chunk_size))),
+                             text=f"Preprocessed and classified {processed:,} rows…")
+        preview = pd.concat(preview_parts, ignore_index=True) if preview_parts else pd.DataFrame()
+        return {
+            "output_path": output_path, "preview": preview, "alerts": alert_candidates,
+            "total_rows": total_rows, "malicious_rows": malicious_rows, "high_rows": high_rows,
+            "routed_rows": routed_rows, "source_name": source_name,
+        }
+    except Exception:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        raise
+
+
+def analyze_synthetic(bundle: dict[str, Any]) -> dict[str, Any]:
+    """Create and analyze the requested 500-row demonstration dataset."""
+    data = generate_synthetic_data(500)
+    return analyze_csv_in_chunks(io.StringIO(data.to_csv(index=False)), bundle, chunk_size=100)
+
+
+def build_alert_report(row: pd.Series, bundle: dict[str, Any],
+                       index: faiss.IndexFlatL2, ids: list[str],
+                       embedder: SentenceTransformer) -> dict[str, Any]:
+    """Compute SHAP, optional quantum score, and retrieved ATT&CK playbook."""
+    evidence = explain_flow(row, bundle)
+    retrieval = retrieve_mitre(row, evidence, index, ids, embedder)
+    probability = float(row["Threat_Probability"])
+    is_routed = EDGE_LOW <= probability <= EDGE_HIGH
+    quantum_score = quantum_risk_score(row, bundle) if is_routed else None
     return {
-        "technique_id": primary_id, "retrieved_id": retrieved_id,
-        "distance": distance, "query": query,
-        "technique": THREAT_INTEL[primary_id],
+        "flow_id": str(row.get("Flow_ID", "Unknown")),
+        "source_ip": str(row.get("Source_IP", "Unknown")),
+        "dest_ip": str(row.get("Dest_IP", "Unknown")),
+        "port": int(float(row["Destination_Port"])),
+        "probability": probability, "priority": str(row["Priority"]),
+        "evidence": evidence, "retrieval": retrieval,
+        "quantum_routed": is_routed, "quantum_score": quantum_score,
+        "warning": str(row.get("Preprocessing_Warning", "None")),
     }
-
-
-# 8. Deterministic report generator ------------------------------------------
-def generate_report(flow: pd.Series | dict[str, Any], pred_class: str,
-                    confidence: float, evidence: list[dict[str, Any]],
-                    retrieval: dict[str, Any]) -> dict[str, Any]:
-    """Build a complete deterministic alert report from measured values and KB."""
-    technique = retrieval["technique"]
-    flow_id = str(flow.get("Flow_ID", "Unknown"))
-    source = str(flow.get("Source_IP", "Unknown"))
-    destination = str(flow.get("Dest_IP", "Unknown"))
-    port = int(float(flow.get("Destination_Port", 0)))
-    priority = "High" if confidence >= 90 and pred_class in HIGH_PRIORITY_CLASSES else "Medium"
-    e1, e2, e3 = evidence
-    narrative = (
-        f"Flow {flow_id} from {source} to {destination}:{port} was classified as {pred_class} "
-        f"with {confidence:.1f}% confidence. The decision was driven by "
-        f"{e1['feature']} ({e1['value']:.4g} versus a benign baseline of {e1['baseline']:.4g}), "
-        f"{e2['feature']} ({e2['value']:.4g} versus {e2['baseline']:.4g}) and "
-        f"{e3['feature']} ({e3['value']:.4g} versus {e3['baseline']:.4g}). "
-        f"This behavior matches MITRE ATT&CK {technique['id']} ({technique['name']}) "
-        f"under the {technique['tactic']} tactic. {technique['impact']}"
-    )
-    return {
-        "flow_id": flow_id, "source_ip": source, "dest_ip": destination, "port": port,
-        "classification": pred_class, "confidence": float(confidence), "priority": priority,
-        "evidence": evidence, "mitre_id": technique["id"], "mitre_name": technique["name"],
-        "tactic": technique["tactic"], "retrieved_id": retrieval["retrieved_id"],
-        "retrieval_distance": retrieval["distance"], "narrative": narrative,
-        "checklist": [
-            {"step": f"Step {number} {label}", "action": action}
-            for number, (label, action) in enumerate(zip(
-                ("Contain", "Investigate", "Remediate"), technique["actions"]), 1)
-        ],
-    }
-
-
-def triage_flow(flow: pd.Series | dict[str, Any], bundle: dict[str, Any],
-                index: faiss.IndexFlatL2 | None = None,
-                ordered_ids: list[str] | None = None,
-                embedder: SentenceTransformer | None = None) -> dict[str, Any]:
-    """Explain, retrieve, and report for one already-classified flow."""
-    evidence = explain_flow(flow, bundle)
-    retrieval = retrieve_technique(
-        str(flow["Predicted"]), evidence, index, ordered_ids, embedder,
-        port=int(float(flow["Destination_Port"])),
-    )
-    return generate_report(flow, str(flow["Predicted"]), float(flow["Confidence"]), evidence, retrieval)
-
-
-def reports_to_frame(reports: list[dict[str, Any]]) -> pd.DataFrame:
-    """Flatten deterministic triage reports for CSV download."""
-    rows = []
-    for report in reports:
-        row = {key: value for key, value in report.items() if key not in {"evidence", "checklist"}}
-        row["evidence"] = json.dumps(report["evidence"], ensure_ascii=False)
-        row["checklist"] = json.dumps(report["checklist"], ensure_ascii=False)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-# 9. Streamlit dashboard ------------------------------------------------------
-def system_status(bundle: dict[str, Any], index: faiss.IndexFlatL2,
-                  ordered_ids: list[str], embedder: SentenceTransformer) -> dict[str, bool]:
-    """Derive sidebar health indicators from the loaded runtime objects."""
-    model = bundle.get("model")
-    model_ok = bool(
-        model is not None
-        and hasattr(model, "classes_")
-        and getattr(model, "n_features_in_", 0) == len(FEATURES)
-        and np.isfinite(bundle.get("accuracy", np.nan))
-    )
-    index_ok = bool(
-        index is not None
-        and index.is_trained
-        and index.d == 384
-        and index.ntotal == len(ordered_ids) == len(THREAT_INTEL)
-    )
-    local_ok = bool(
-        model_ok
-        and index_ok
-        and str(getattr(embedder, "device", "")) == "cpu"
-        and isinstance(embedder, SentenceTransformer)
-    )
-    return {"model": model_ok, "index": index_ok, "local": local_ok}
-
-
-def _style_flows(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
-    def color_row(row: pd.Series) -> list[str]:
-        color = "#4a2028" if bool(row["Is_Malicious"]) else "#18352f"
-        return [f"background-color: {color}; color: #e6edf3"] * len(row)
-    return frame.style.apply(color_row, axis=1)
 
 
 def main() -> None:
-    """Render the local Streamlit SOC dashboard."""
-    st.set_page_config(layout="wide", page_title="ThreatLens | SOC Co-Pilot", page_icon="🛡️")
-    st.title("🛡️ ThreatLens | SOC Co-Pilot")
-    st.caption("Evidence-grounded network triage · local Random Forest · MITRE ATT&CK retrieval")
+    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
+    st.title("🛡️ ThreatLens")
+    st.caption("Hybrid Quantum-Classical AI Co-Pilot for Explainable Threat Triage")
+    st.markdown(
+        "Local network-flow preprocessing, XGBoost detection, SHAP explanations, "
+        "a PennyLane quantum simulator for ambiguous scores, and local ATT&CK retrieval."
+    )
 
-    st.sidebar.header("ThreatLens | SOC Co-Pilot")
-    uploaded = st.sidebar.file_uploader("Upload network flow CSV", type=["csv"])
-    if st.sidebar.button("Load Synthetic Network Logs", width="stretch"):
-        st.session_state["df"] = generate_flows()
-    if uploaded is not None:
-        cleaned = load_uploaded_csv(uploaded)
-        if cleaned is not None:
-            st.session_state["df"] = cleaned
+    with st.sidebar:
+        st.header("Data ingestion")
+        uploaded = st.file_uploader("Upload network data in CSV format", type=["csv"])
+        chunk_size = st.select_slider(
+            "Rows per processing batch", options=[5_000, 10_000, 25_000, 50_000, 100_000, 250_000],
+            value=DEFAULT_CHUNK_SIZE, format_func=lambda value: f"{value:,}",
+            help="Larger batches can be faster but use more RAM.",
+        )
+        run_upload = st.button("Preprocess & Analyze CSV", type="primary", use_container_width=True)
+        run_synth = st.button("Load Synthetic Attack Benchmark", use_container_width=True)
+        st.divider()
+        st.subheader("System status")
+        with st.spinner("Loading local ML, embedding, and quantum resources…"):
+            try:
+                bundle = train_model()
+                index, technique_ids = build_faiss_index()
+                embedder = load_embedder()
+                ready = True
+            except Exception as exc:
+                ready = False
+                st.error(f"Local resource initialization failed: {exc}")
+        st.write(f"{'🟢' if ready else '🔴'} Local ML Engine: {'Online' if ready else 'Unavailable'}")
+        faiss_ready = ready and index.d == 384 and index.ntotal == len(MITRE)
+        st.write(f"{'🟢' if faiss_ready else '🔴'} FAISS: {'Loaded' if faiss_ready else 'Unavailable'}")
+        st.write(f"{'🟢' if ready else '🔴'} QPU Simulator: {'Ready (default.qubit)' if ready else 'Unavailable'}")
+        st.write("🟢 Traffic analysis: local CPU processing")
+        if ready:
+            with st.expander("Synthetic hold-out model metrics"):
+                st.write({key: round(value, 4) if isinstance(value, float) else value
+                          for key, value in bundle["metrics"].items()})
+                st.caption("Metrics are from synthetic data only; they do not establish real-world detection accuracy.")
+
+    if not ready:
+        st.stop()
+
+    if run_synth:
+        with st.spinner("Creating and analyzing 500 synthetic network flows…"):
+            state = analyze_synthetic(bundle)
+            st.session_state["threatlens_analysis"] = state
+            st.session_state["threatlens_reports"] = None
+    elif uploaded is not None and run_upload:
+        progress = st.progress(0, text="Starting CSV preprocessing…")
+        try:
+            with st.spinner("Streaming, preprocessing, and classifying CSV chunks locally…"):
+                state = analyze_csv_in_chunks(uploaded, bundle, chunk_size, progress.progress)
+            st.session_state["threatlens_analysis"] = state
+            st.session_state["threatlens_reports"] = None
+        except Exception as exc:
+            st.error(f"CSV preprocessing/analysis failed: {exc}")
+        finally:
+            progress.empty()
+    elif uploaded is not None:
+        st.info("Choose **Preprocess & Analyze CSV** to process the uploaded file in batches.")
+
+    state = st.session_state.get("threatlens_analysis")
+    if not state:
+        st.info("Upload a network-flow CSV or load the 500-row synthetic benchmark to begin.")
+        st.markdown(
+            "**CSV compatibility:** ThreatLens normalizes recognized CICIDS/NetFlow/Zeek-style field names and derives some rates when source measurements allow it. "
+            "When required measurements cannot be found, it reports that and uses zero for the absent model input; inspect preprocessing warnings because such predictions may be unreliable."
+        )
+        return
+
+    m = st.columns(4)
+    m[0].metric("Total Flows Analyzed", f"{state['total_rows']:,}")
+    m[1].metric("High-Confidence Threats", f"{state['high_rows']:,}")
+    m[2].metric("Quantum-Routed Edge Cases", f"{state['routed_rows']:,}")
+    reports = st.session_state.get("threatlens_reports")
+    mean_triage = reports.get("mean_ms") if isinstance(reports, dict) else None
+    m[3].metric("Mean Triage Time", f"{mean_triage:.2f} ms / alert" if mean_triage is not None else "Not computed yet")
+
+    st.subheader("Preprocessed network flow preview")
+    preview = state["preview"]
+    if not preview.empty:
+        def color_predicted_rows(row: pd.Series) -> list[str]:
+            color = "#4a2028" if int(row.get("Prediction", 0)) == 1 else "#18352f"
+            return [f"background-color: {color}; color: #e6edf3"] * len(row)
+        st.dataframe(preview.head(PREVIEW_ROWS).style.apply(color_predicted_rows, axis=1),
+                     use_container_width=True, height=420)
+    st.caption("Large-file mode writes the complete preprocessed predictions to a local temporary CSV; only the preview and top 200 candidate alerts are held in memory.")
+
+    with st.expander("Preprocessing diagnostics", expanded=True):
+        all_warnings = preview.get("Preprocessing_Warning", pd.Series(dtype=str))
+        warnings = sorted({str(item) for item in all_warnings if str(item) != "None"})
+        if warnings:
+            for warning in warnings:
+                st.warning(warning)
         else:
-            st.session_state.pop("df", None)
+            st.success("No missing model columns or invalid numeric cells were detected in the preview.")
+        st.write(f"Processed file: **{Path(state['output_path']).name}** (local temporary file)")
+        st.caption("The current model uses seven fixed numerical features. Different schemas are not semantically interchangeable; zero-filled features should be reviewed before trusting the score.")
 
+    output_path = state["output_path"]
     try:
-        with st.spinner("Loading local model and MITRE retrieval index…"):
-            bundle = train_model()
-            index, ordered_ids = build_vector_index()
-            embedder = load_embedder()
-        status = system_status(bundle, index, ordered_ids, embedder)
-        (st.sidebar.success if status["model"] else st.sidebar.error)(
-            f"Model {'loaded' if status['model'] else 'unavailable'} · hold-out accuracy {bundle['accuracy']:.1%}"
-        )
-        (st.sidebar.success if status["index"] else st.sidebar.error)(
-            f"Vector index {'active' if status['index'] else 'unavailable'} · {index.ntotal} techniques"
-        )
-        (st.sidebar.success if status["local"] else st.sidebar.error)(
-            "Zero data leakage · local CPU inference and retrieval" if status["local"]
-            else "Local processing unavailable"
-        )
-    except Exception as exc:
-        st.sidebar.error(f"Model or vector index unavailable: {exc}")
-        st.error("ThreatLens could not load its local resources. Check installed dependencies and cached model files.")
-        return
-
-    with st.sidebar.expander("Priority rule"):
-        st.write("High when model confidence is at least 90% and the class is DDoS, BruteForce, or PrivilegeAnomaly. All other alerts are Medium.")
-    with st.sidebar.expander("Model Quality"):
-        st.caption("Stratified synthetic hold-out split · 25% test size · random_state=42")
-        st.code(bundle["classification_report"], language="text")
-
-    if "df" not in st.session_state:
-        st.info("Upload a network-flow CSV or load the synthetic demo dataset to begin.")
-        return
-    data = st.session_state["df"].copy()
-    missing = [feature for feature in FEATURES if feature not in data.columns]
-    if missing:
-        st.error("CSV is missing required feature columns: " + ", ".join(missing))
-        return
-
-    try:
-        predicted = predict_flows(data, bundle)
-    except (KeyError, TypeError, ValueError) as exc:
-        st.error(f"Could not classify these flows: {exc}")
-        return
-
-    malicious = predicted.loc[predicted["Is_Malicious"]].sort_values("Confidence", ascending=False)
-    high_count = int((malicious["Confidence"].ge(90) & malicious["Predicted"].isin(HIGH_PRIORITY_CLASSES)).sum())
-    display_alerts = malicious.head(50)
-    reports: list[dict[str, Any]] = []
-    started = time.perf_counter()
-    for _, flow in display_alerts.iterrows():
-        reports.append(triage_flow(flow, bundle, index, ordered_ids, embedder))
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    mean_triage_ms = elapsed_ms / len(reports) if reports else None
-
-    metrics = st.columns(4)
-    metrics[0].metric("Total Network Flows Analyzed", f"{len(predicted):,}")
-    metrics[1].metric("Malicious Anomalies Detected", f"{len(malicious):,}")
-    metrics[2].metric("High-Priority Alerts", f"{high_count:,}")
-    triage_label = f"{mean_triage_ms:.2f} ms / alert" if mean_triage_ms is not None else "N/A"
-    metrics[3].metric("Mean Triage Time", triage_label)
-
-    st.subheader("Network flow overview")
-    display = predicted.head(500)
-    st.dataframe(_style_flows(display), width="stretch", height=420)
-    if len(predicted) > 500:
-        st.caption("Showing the first 500 rows for responsiveness.")
-
-    if reports:
+        with open(output_path, "rb") as result_file:
+            output_bytes = result_file.read()
         st.download_button(
-            "Download triage reports (CSV)", reports_to_frame(reports).to_csv(index=False).encode("utf-8"),
-            "threatlens_triage_reports.csv", "text/csv",
+            "Download full preprocessed predictions (CSV)", data=output_bytes,
+            file_name="threatlens_preprocessed_predictions.csv", mime="text/csv",
         )
-    st.subheader("Alert triage")
-    if malicious.empty:
-        st.success("No malicious flows detected in this dataset.")
+    except OSError as exc:
+        st.error(f"Preprocessed output is no longer available: {exc}")
+
+    candidates = state["alerts"]
+    if candidates.empty:
+        st.success("The classifier did not flag malicious flows in this dataset.")
         return
-    if len(malicious) > len(reports):
-        st.caption("Showing the 50 highest-confidence flagged flows.")
-    for report in reports:
-        title = (f"{report['classification']} · {report['priority']} priority · "
-                 f"{report['confidence']:.1f}% confidence · {report['flow_id']}")
+    st.subheader("Triage alerts")
+    if len(candidates) > MAX_ALERT_CARDS:
+        st.caption(f"Showing the top {MAX_ALERT_CARDS} malicious candidates by classifier score.")
+    candidates = candidates.head(MAX_ALERT_CARDS)
+    if not isinstance(reports, dict) or reports.get("key") != state["output_path"]:
+        all_reports = []
+        started = time.perf_counter()
+        with st.spinner("Calculating SHAP evidence, optional quantum scores, and ATT&CK retrieval for top alerts…"):
+            for _, row in candidates.iterrows():
+                all_reports.append(build_alert_report(row, bundle, index, technique_ids, embedder))
+        elapsed = (time.perf_counter() - started) * 1000
+        report_state = {"key": state["output_path"], "items": all_reports,
+                        "mean_ms": elapsed / max(1, len(all_reports))}
+        st.session_state["threatlens_reports"] = report_state
+        reports = report_state
+        m[3].metric("Mean Triage Time", f"{reports['mean_ms']:.2f} ms / alert")
+
+    for report in reports["items"]:
+        title = f"{report['priority']} · {report['probability']:.1%} threat score · {report['flow_id']}"
         with st.expander(title):
             left, right = st.columns([1, 1])
             with left:
-                st.caption("Share of top-3 trigger evidence")
-                chart = pd.DataFrame({"Share (%)": [item["share"] for item in report["evidence"]]},
-                                     index=[item["feature"] for item in report["evidence"]])
-                st.bar_chart(chart, horizontal=True, color="#ff4b4b")
-                evidence_table = pd.DataFrame(report["evidence"]).rename(columns={
-                    "feature": "Feature", "share": "Share (%)", "value": "Value",
-                    "baseline": "Benign baseline", "ratio": "Ratio", "direction": "Direction",
-                })
-                st.dataframe(evidence_table, hide_index=True, width="stretch")
+                st.markdown("**SHAP mathematical evidence — top 3 features**")
+                chart = pd.DataFrame(
+                    {"Absolute SHAP": [item["absolute_shap"] for item in report["evidence"]]},
+                    index=[item["feature"] for item in report["evidence"]],
+                )
+                st.bar_chart(chart, horizontal=True)
+                st.dataframe(pd.DataFrame(report["evidence"]), hide_index=True, use_container_width=True)
+                st.caption("Absolute SHAP values rank this row's feature effects on the model output; they are not attack probabilities or causal proof.")
             with right:
-                st.markdown(f"### {report['mitre_id']} · {report['mitre_name']}")
-                st.write(f"**Tactic:** {report['tactic']}  ·  **Retrieval distance:** {report['retrieval_distance']:.3f}")
-                if report["retrieved_id"] != report["mitre_id"]:
-                    st.caption(f"Nearest vector entry: {report['retrieved_id']}; class mapping retained as primary.")
-                st.write(report["narrative"])
-                st.markdown("**Response checklist**")
-                for action in report["checklist"]:
-                    st.markdown(f"- **{action['step']}:** {action['action']}")
+                technique = report["retrieval"]["technique"]
+                st.markdown(f"**MITRE ATT&CK: {technique['id']} — {technique['name']}**")
+                st.write(f"**Tactic:** {technique['tactic']}")
+                st.write(f"**FAISS retrieval distance:** {report['retrieval']['distance']:.4f} (lower means closer in this embedding space)")
+                if report["quantum_routed"]:
+                    st.metric("Quantum circuit score (exploratory)", f"{report['quantum_score']:.3f}")
+                    st.caption("Only run for XGBoost scores between 0.40 and 0.65 inclusive. This fixed-parameter simulator score is not a calibrated probability and does not override XGBoost.")
+                else:
+                    st.write("**Quantum edge-case resolver:** Not routed (classifier score outside 0.40–0.65).")
+                st.markdown("**SOC mitigation playbook**")
+                for step in technique["mitigations"]:
+                    st.markdown(f"- {step}")
+                if report["warning"] != "None":
+                    st.warning(report["warning"])
+                st.caption(f"Context is a retrieval match from a six-entry local reference set, not confirmation that the technique occurred.")
 
 
 if __name__ == "__main__":
