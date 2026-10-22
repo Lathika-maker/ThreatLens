@@ -597,7 +597,7 @@ def main() -> None:
         faiss_ready = ready and index.d == 384 and index.ntotal == len(MITRE)
         st.write(f"{'🟢' if faiss_ready else '🔴'} FAISS: {'Loaded' if faiss_ready else 'Unavailable'}")
         st.write(f"{'🟢' if ready else '🔴'} QPU Simulator: {'Ready (default.qubit)' if ready else 'Unavailable'}")
-        st.write("🟢 Traffic analysis: local CPU processing")
+        st.write("🟢 Zero Data Leakage: flow data stays local")
         if ready:
             with st.expander("Synthetic hold-out model metrics"):
                 st.write({key: round(value, 4) if isinstance(value, float) else value
