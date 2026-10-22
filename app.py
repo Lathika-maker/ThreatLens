@@ -105,8 +105,67 @@ def validate_input_frame(raw: pd.DataFrame, features: list[str], max_rows: int =
     return matrix.astype(np.float32)
 
 
+# Replace each placeholder with the share ID from a Google Drive file link.
+# The Drive files must be accessible to the deployment service account/public-link policy.
+ARTIFACT_DRIVE_IDS = {
+    "artifacts/xgboost_model.joblib": "REPLACE_WITH_GDRIVE_ID",
+    "artifacts/isolation_forest.joblib": "REPLACE_WITH_GDRIVE_ID",
+    "artifacts/label_encoder.joblib": "REPLACE_WITH_GDRIVE_ID",
+    "artifacts/imputer.joblib": "REPLACE_WITH_GDRIVE_ID",
+    "artifacts/model_metadata.json": "REPLACE_WITH_GDRIVE_ID",
+}
+ARTIFACT_FILENAMES = tuple(Path(name).name for name in ARTIFACT_DRIVE_IDS)
+
+
+def ensure_artifacts_present() -> None:
+    """Download missing artifacts from Drive, or fail with an actionable error."""
+    missing = [
+        (relative_name, ARTIFACT_DIR / Path(relative_name).name, drive_id)
+        for relative_name, drive_id in ARTIFACT_DRIVE_IDS.items()
+        if not (ARTIFACT_DIR / Path(relative_name).name).is_file()
+    ]
+    if not missing:
+        return
+
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    with st.spinner("Downloading heavy enterprise model artifacts (>100MB) from secure cloud storage..."):
+        invalid_ids = [
+            name for name, _path, drive_id in missing
+            if not drive_id or drive_id.startswith("REPLACE_") or drive_id.strip() in {"", "YOUR_FILE_ID"}
+        ]
+        if invalid_ids:
+            raise RuntimeError(
+                "Google Drive IDs are still placeholders for: " + ", ".join(invalid_ids)
+            )
+        try:
+            import gdown
+        except ImportError as exc:
+            raise RuntimeError(
+                "gdown is not installed. Install dependencies from requirements.txt and redeploy."
+            ) from exc
+
+        failed = []
+        for relative_name, destination, drive_id in missing:
+            try:
+                result = gdown.download(
+                    id=drive_id,
+                    output=str(destination),
+                    quiet=False,
+                    fuzzy=True,
+                )
+                if not result or not destination.is_file() or destination.stat().st_size == 0:
+                    failed.append(relative_name)
+            except Exception:
+                failed.append(relative_name)
+        if failed:
+            for name in failed:
+                (ARTIFACT_DIR / Path(name).name).unlink(missing_ok=True)
+            raise RuntimeError("Google Drive download failed or returned empty files: " + ", ".join(failed))
+
+
 @st.cache_resource(max_entries=1, show_spinner=False)
 def load_artifacts() -> dict[str, Any]:
+    ensure_artifacts_present()
     paths = {
         "model": ARTIFACT_DIR / "xgboost_model.joblib",
         "ood": ARTIFACT_DIR / "isolation_forest.joblib",
@@ -116,8 +175,7 @@ def load_artifacts() -> dict[str, Any]:
     }
     missing = [str(p) for p in paths.values() if not p.is_file()]
     if missing:
-        raise FileNotFoundError("Missing trained artifacts: " + ", ".join(missing) +
-            ". Run train_model.py locally and make artifacts available to the app.")
+        raise FileNotFoundError("Missing trained artifacts after cloud retrieval: " + ", ".join(missing))
     metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
     features = metadata.get("feature_columns")
     if not isinstance(features, list) or len(features) != MAX_FEATURES:
@@ -247,8 +305,10 @@ def main() -> None:
     except Exception as exc:
         bundle, artifact_error = None, str(exc)
 
-    if bundle is None and artifact_error and artifact_error.startswith("Missing trained artifacts:"):
+    if bundle is None:
         st.error("Model artifacts not found. Please run train_model.py locally and commit the exported models to the repository.")
+        if artifact_error:
+            st.caption(f"Artifact recovery detail: {safe_text(artifact_error, 500)}")
         st.stop()
 
     supabase = get_supabase_client()
