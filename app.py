@@ -386,25 +386,20 @@ def deterministic_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> s
 
 
 @st.cache_resource(max_entries=1, show_spinner=False)
-def load_flan_t5_model():
-    """Load and dynamically quantize FLAN-T5 for CPU inference on demand."""
-    from transformers import T5ForConditionalGeneration, T5Tokenizer
+def load_flan_t5_pipeline():
+    """Load the compact FLAN-T5 77M pipeline only after an explicit user request."""
+    from transformers import pipeline
 
-    tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-small")
-    model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-small")
-    model.eval()
-    quantized_model = torch.quantization.quantize_dynamic(
-        model,
-        {torch.nn.Linear},
-        dtype=torch.qint8,
+    return pipeline(
+        "text2text-generation",
+        model="MBZUAI/LaMini-Flan-T5-77M",
+        max_new_tokens=40,
+        device=-1,
     )
-    del model
-    gc.collect()
-    return tokenizer, quantized_model
 
 
 def generate_ai_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str:
-    """Generate a short evidence-grounded narrative with a cached INT8 CPU model."""
+    """Generate a short evidence-grounded narrative with the cached compact pipeline."""
     facts = deterministic_narrative(row, evidence)
     prompt = (
         "Write a concise SOC triage explanation using ONLY the evidence below. "
@@ -412,21 +407,13 @@ def generate_ai_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str
         "State that SHAP shows model contribution, not causation. If evidence is insufficient, say so.\n\n"
         + facts
     )
-    tokenizer, quantized_model = load_flan_t5_model()
-    inputs = tokenizer(
+    result = load_flan_t5_pipeline()(
         prompt,
-        return_tensors="pt",
+        max_new_tokens=40,
+        do_sample=False,
         truncation=True,
-        max_length=512,
     )
-    with torch.inference_mode():
-        output_ids = quantized_model.generate(
-            **inputs,
-            max_new_tokens=64,
-            do_sample=False,
-            num_beams=1,
-        )
-    generated = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+    generated = str(result[0]["generated_text"]).strip()
     if not generated:
         raise ValueError("FLAN-T5 returned an empty narrative.")
     return generated
@@ -640,9 +627,13 @@ def build_alert_report(row: pd.Series, bundle: dict[str, Any],
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
+    st.set_page_config(page_title="ThreatLens | Explainable AI Threat Triage Dashboard", page_icon="🛡️", layout="wide")
     st.title("🛡️ ThreatLens")
     st.caption("Hybrid Quantum-Classical AI Co-Pilot for Explainable Threat Triage")
+    st.markdown(
+        "ThreatLens is an open-source, AI-powered cybersecurity co-pilot for SOC analysts, "
+        "utilizing XGBoost, SHAP, and MITRE ATT&CK for real-time network threat triage."
+    )
     st.markdown(
         "Local network-flow preprocessing, XGBoost detection, SHAP explanations, "
         "a PennyLane quantum simulator for ambiguous scores, and local ATT&CK retrieval."
@@ -806,7 +797,7 @@ def main() -> None:
                 if st.button(
                     "Generate AI Narrative",
                     key=f"generate_ai_narrative_{report['flow_id']}",
-                    help="Loads google/flan-t5-small only when requested. The deterministic SHAP explanation remains the fallback.",
+                    help="Loads MBZUAI/LaMini-Flan-T5-77M only when requested. The deterministic SHAP explanation remains the fallback.",
                 ):
                     fallback_narrative = deterministic_narrative(
                         pd.Series({
