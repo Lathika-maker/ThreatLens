@@ -633,7 +633,6 @@ def main() -> None:
     st.markdown(
         "ThreatLens is an open-source, AI-powered cybersecurity co-pilot for SOC analysts, "
         "utilizing XGBoost, SHAP, and MITRE ATT&CK for real-time network threat triage.",
-        help="ThreatLens explainable AI threat triage dashboard for SOC analysts."
     )
     st.markdown(
         "Local network-flow preprocessing, XGBoost detection, SHAP explanations, "
