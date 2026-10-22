@@ -148,10 +148,10 @@ def main() -> None:
     ))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, args.output_dir / "xgboost_model.joblib", compress=3)
-    joblib.dump(ood, args.output_dir / "isolation_forest.joblib", compress=3)
-    joblib.dump(encoder, args.output_dir / "label_encoder.joblib", compress=3)
-    joblib.dump(imputer, args.output_dir / "imputer.joblib", compress=3)
+    joblib.dump(model, args.output_dir / "xgboost_model.joblib", compress=9)
+    joblib.dump(ood, args.output_dir / "isolation_forest.joblib", compress=9)
+    joblib.dump(encoder, args.output_dir / "label_encoder.joblib", compress=9)
+    joblib.dump(imputer, args.output_dir / "imputer.joblib", compress=9)
     metadata = {
         "feature_columns": features,
         "label_column": label_col,
