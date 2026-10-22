@@ -108,10 +108,11 @@ ALIASES = {
     "flowduration": "Flow_Duration", "duration": "Flow_Duration",
     "totalfwdpackets": "Total_Fwd_Packets", "tot_fwd_pkts": "Total_Fwd_Packets",
     "fwd_packets": "Total_Fwd_Packets", "forward_packets": "Total_Fwd_Packets",
-    "totalbackwardpackets": "Total_Bwd_Packets", "total_bwd_pkts": "Total_Bwd_Packets",
+    "totalbackwardpackets": "Total_Bwd_Packets", "total_bwd_packets": "Total_Bwd_Packets", "total_bwd_pkts": "Total_Bwd_Packets",
     "tot_bwd_pkts": "Total_Bwd_Packets", "bwd_packets": "Total_Bwd_Packets",
-    "flowbytes_s": "Flow_Bytes_s", "flow_bytes_sec": "Flow_Bytes_s",
+    "flowbytes_s": "Flow_Bytes_s", "flow_bytes_s": "Flow_Bytes_s", "flow_bytes_sec": "Flow_Bytes_s",
     "flow_bytes_per_s": "Flow_Bytes_s", "bytes_per_second": "Flow_Bytes_s",
+    "flow_packets_s": "Flow_Packets_s", "flow_packets_sec": "Flow_Packets_s",
     "avg_packet_length": "Packet_Length_Mean", "average_packet_size": "Packet_Length_Mean",
     "packet_length_mean": "Packet_Length_Mean", "avg_pkt_size": "Packet_Length_Mean",
     "syn_flag_count": "SYN_Flag_Count", "syn_count": "SYN_Flag_Count",
@@ -122,6 +123,8 @@ ALIASES = {
     "total_len_bwd_pkts": "Total_Length_Bwd_Packets",
     "totlen_fwd_pkts": "Total_Length_Fwd_Packets",
     "totlen_bwd_pkts": "Total_Length_Bwd_Packets",
+    "total_length_of_fwd_packets": "Total_Length_Fwd_Packets",
+    "total_length_of_bwd_packets": "Total_Length_Bwd_Packets",
     "fwd_pkt_len_mean": "Fwd_Packet_Length_Mean",
     "bwd_pkt_len_mean": "Bwd_Packet_Length_Mean",
 }
@@ -442,7 +445,7 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
                 malicious_rows += int(predicted["Prediction"].sum())
                 high_rows += int((predicted["Priority"] == "HIGH").sum())
                 routed_rows += int(predicted["Quantum_Routed"].sum())
-                if len(pd.concat(preview_parts, ignore_index=True)) < PREVIEW_ROWS:
+                if sum(len(part) for part in preview_parts) < PREVIEW_ROWS:
                     remaining = PREVIEW_ROWS - sum(len(part) for part in preview_parts)
                     preview_parts.append(predicted.head(remaining).copy())
                 candidates = predicted.loc[predicted["Prediction"] == 1].nlargest(
