@@ -30,7 +30,7 @@ st.set_page_config(page_title="ThreatLens | SOC Co-Pilot", page_icon="🛡️", 
 
 ARTIFACT_DIR = Path(os.getenv("THREATLENS_ARTIFACT_DIR", "artifacts"))
 MAX_FEATURES = 40
-MAX_UPLOAD_MB = 80
+MAX_UPLOAD_MB = 100
 MAX_ROWS = 2_000_000
 DEFAULT_ANALYSIS_ROWS = 500_000
 MAX_ALERTS = 100
@@ -290,6 +290,37 @@ def generate_narrative(attack: str, evidence: str) -> str:
         gc.collect()
 
 
+def car_response_plan(attack: str, severity_value: str, is_ood: bool) -> dict[str, list[str]]:
+    """Evidence-led Contain, Analyze, Remediate response suggestions; never auto-executes actions."""
+    if is_ood:
+        return {
+            "Contain": ["Do not auto-block from an anomaly score alone; preserve the flow and consider temporary containment only if corroborating telemetry supports active harm."],
+            "Analyze": ["Correlate source/destination, endpoint, DNS, identity, firewall and application logs; compare with a known-good baseline."],
+            "Remediate": ["Address only the confirmed root cause; tune detections after review and document the evidence."],
+        }
+    attack_l = attack.casefold()
+    if "ddos" in attack_l or "dos " in attack_l:
+        contain = ["Validate service impact and traffic surge; apply scoped rate limits or upstream DDoS controls if confirmed."]
+        remediate = ["Harden exposed services, tune rate limiting and capacity protections, and verify service recovery."]
+    elif "brute force" in attack_l or "patator" in attack_l:
+        contain = ["Review authentication telemetry; temporarily block or rate-limit confirmed abusive sources and protect affected accounts."]
+        remediate = ["Reset potentially exposed credentials, enforce MFA, tune lockout controls, and remove exposed services where unnecessary."]
+    elif "portscan" in attack_l:
+        contain = ["Confirm the scanner and asset scope; apply narrowly scoped filtering only if unauthorized scanning is confirmed."]
+        remediate = ["Reduce unnecessary exposure, review firewall rules, and tune scan detection thresholds."]
+    elif "sql injection" in attack_l or "xss" in attack_l or "web attack" in attack_l:
+        contain = ["Correlate WAF, web-server and application logs; block a confirmed malicious request pattern with a scoped rule."]
+        remediate = ["Use parameterized queries and context-aware output encoding, patch affected components, and add regression tests."]
+    elif "heartbleed" in attack_l:
+        contain = ["Identify affected TLS endpoints and restrict exposure while verifying vulnerable software versions."]
+        remediate = ["Patch or replace vulnerable TLS libraries and rotate secrets if exposure is confirmed."]
+    else:
+        contain = ["Validate the alert with independent telemetry before blocking a host, account or connection."]
+        remediate = ["Remediate the confirmed root cause, patch affected assets where applicable, and verify the fix."]
+    analyze = ["Review the top contributing features and model score; correlate with independent endpoint, network and identity evidence. A model score is not proof of compromise."]
+    return {"Contain": contain, "Analyze": analyze, "Remediate": remediate}
+
+
 def get_supabase_client():
     try:
         from supabase import create_client
@@ -318,7 +349,12 @@ def main() -> None:
     supabase = get_supabase_client()
     with st.sidebar:
         st.header("Data ingestion")
-        upload = st.file_uploader("Upload network-flow CSV", type=["csv"])
+        upload = st.file_uploader(
+            "Upload network-flow CSV",
+            type=["csv"],
+            max_upload_size=MAX_UPLOAD_MB,
+            help="CSV files up to 100 MB. Analysis is limited by the row slider and available memory.",
+        )
         analysis_row_limit = st.slider(
             "Rows to analyze",
             min_value=10_000,
@@ -432,24 +468,39 @@ def main() -> None:
     remaining = np.flatnonzero(~vault_hit)
     if len(remaining):
         ood[remaining] = np.asarray(bundle["ood"].predict(X_scaled.iloc[remaining])) == -1
+    class_names = [str(v) for v in bundle["encoder"].classes_]
     pred = np.full(len(X), -1, dtype=np.int32)
     confidence = np.full(len(X), np.nan, dtype=np.float32)
+    probability_details: list[list[dict[str, float | str]] | None] = [None] * len(X)
     confidence[vault_hit] = vault_similarities[vault_hit]
     trusted = np.flatnonzero(~vault_hit & ~ood)
     if len(trusted):
         probabilities = bundle["model"].predict_proba(X_scaled.iloc[trusted])
         pred[trusted] = np.argmax(probabilities, axis=1)
         confidence[trusted] = np.max(probabilities, axis=1)
+        for local_i, global_i in enumerate(trusted):
+            order = np.argsort(probabilities[local_i])[::-1][:min(5, probabilities.shape[1])]
+            probability_details[int(global_i)] = [
+                {"class": class_names[int(class_idx)], "score": float(probabilities[local_i, class_idx]) * 100.0}
+                for class_idx in order
+            ]
         del probabilities
     elapsed_ms = (time.perf_counter() - started) * 1000
-    class_names = [str(v) for v in bundle["encoder"].classes_]
     labels = [vault_labels[i] if vault_hit[i] else ("Unknown Novel Anomaly" if ood[i] else class_names[int(pred[i])]) for i in range(len(X))]
     benign_names = {"BENIGN", "BENIGN TRAFFIC", "NORMAL", "0"}
     malicious = np.array([not ood[i] and labels[i].strip().upper() not in benign_names for i in range(len(X))])
     severity = ["Unknown" if ood[i] else ("Critical" if malicious[i] and confidence[i] >= .9 else "High" if malicious[i] else "Low") for i in range(len(X))]
+    priority = [
+        "P1 — Immediate review" if ood[i] or (malicious[i] and confidence[i] >= 0.90)
+        else "P2 — High" if malicious[i] and confidence[i] >= 0.70
+        else "P3 — Normal" if malicious[i]
+        else "P4 — Monitor"
+        for i in range(len(X))
+    ]
     alert_ids = [f"TL-{uuid.uuid4().hex[:10].upper()}" for _ in range(len(X))]
     results = pd.DataFrame({
-        "Alert ID": alert_ids, "Threat Class": labels, "Class Confidence": confidence,
+        "Alert ID": alert_ids, "Threat Class": labels, "Severity": severity, "Priority": priority,
+        "Class Confidence": confidence,
         "Distribution Status": ["Threat Vault Override" if vault_hit[i] else "Unknown Novel Anomaly" if ood[i] else "In-distribution" for i in range(len(X))],
         "Vault Cosine Similarity": [float(vault_similarities[i]) if vault_hit[i] else np.nan for i in range(len(X))],
         "Severity": severity,
@@ -474,7 +525,7 @@ def main() -> None:
             explainer = None
             for pos in positions:
                 attack = labels[pos]
-                with st.expander(f"{severity[pos]} · {attack} · {alert_ids[pos]}"):
+                with st.expander(f"{priority[pos]} · {severity[pos]} · {attack} · {alert_ids[pos]}"):
                     xrow = X_scaled.iloc[[pos]]
                     evidence, items = "SHAP unavailable; no feature-impact claim is made.", []
                     if vault_hit[pos]:
@@ -510,24 +561,41 @@ def main() -> None:
                         st.progress(confidence_pct, text="Similarity / model score (not calibrated probability)")
                         st.write(evidence)
                         if items:
+                            st.markdown("**Top feature contributions (SHAP)**")
                             st.bar_chart(pd.DataFrame(items).set_index("feature")[["impact"]])
                             st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
+                            st.caption("SHAP values show how features influenced this model output; they do not independently validate real-world attack probability.")
+                        if probability_details[pos]:
+                            st.markdown("**Model class-score comparison**")
+                            prob_df = pd.DataFrame(probability_details[pos])
+                            st.bar_chart(prob_df.set_index("class")[["score"]])
+                            st.caption("Top XGBoost class scores for this flow. These scores are not calibrated probabilities and do not prove an attack occurred.")
+                        elif vault_hit[pos]:
+                            st.info("This alert was assigned by Threat Vault prototype similarity, not XGBoost class probabilities.")
                         st.markdown("**Contextual Match Confidence**")
                         st.write(f"{match:.1f}%" if match is not None else "Unavailable")
                         st.caption("Semantic proximity in the curated reference corpus, not a calibrated attack probability.")
                     with right:
                         st.markdown("**Why this matters**")
-                        st.write(f"{attack} was assigned by the trained classifier. Review the feature evidence and corroborate it with independent telemetry before containment.")
+                        st.write(f"{attack} was assigned by the model pipeline. Review the evidence and corroborate it with independent telemetry before containment.")
+                        st.markdown(f"**Severity:** {severity[pos]} · **Priority:** {priority[pos]}")
                         narrative_key = f"narrative-{alert_ids[pos]}"
                         if st.button("Generate AI Narrative", key=f"generate-{alert_ids[pos]}"):
-                            st.session_state[narrative_key] = generate_narrative(attack, evidence)
-                        st.write(st.session_state.get(narrative_key, evidence))
+                            st.session_state[narrative_key] = generate_narrative(attack, evidence + " Response guidance: " + mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
+                        st.markdown("**Generative AI analyst narrative**")
+                        st.write(st.session_state.get(narrative_key, "Select Generate AI Narrative to produce an evidence-bounded analyst note."))
                         st.markdown(f"**MITRE ATT&CK tactic:** {mitre.get('tactic', DEFAULT_ATTACK['tactic'])}")
                         st.markdown(f"**MITRE ATT&CK technique:** {mitre.get('technique', DEFAULT_ATTACK['technique'])}")
                         st.write(mitre.get("description", DEFAULT_ATTACK["description"]))
-                        with st.expander("Suggested defensive validation / mitigation", expanded=True):
+                        st.markdown("**CAR response recommendations — Contain, Analyze, Remediate**")
+                        response_plan = car_response_plan(attack, severity[pos], bool(ood[pos]))
+                        for phase, actions in response_plan.items():
+                            st.markdown(f"**{phase}**")
+                            for action in actions:
+                                st.markdown(f"- {action}")
+                        with st.expander("MITRE mitigation reference", expanded=False):
                             st.write(mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
-                            st.caption("Validate these steps against your environment and independent telemetry before taking containment action.")
+                            st.caption("Recommendations are advisory. Validate evidence and authorization before taking containment or remediation action.")
                         if st.button("Save metadata to SOC Ledger", key=f"save-{alert_ids[pos]}"):
                             if supabase is None:
                                 st.error("Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in Streamlit secrets.")
