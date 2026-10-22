@@ -31,45 +31,44 @@ def test_normalizers_trim_bom_and_convert_spaces():
     assert prepare_inference_csv.normalize("Flow Duration") == "Flow_Duration"
 
 
-def test_exact_schema_accepts_valid_numeric_frame_as_float32():
-    result = app.validate_input_frame(valid_frame(), feature_names())
-    assert list(result.columns) == feature_names()
+def test_universal_ingest_preserves_expected_order_and_float32():
+    expected = feature_names()
+    result = app.align_network_features(valid_frame(), expected)
+    assert list(result.columns) == expected
     assert result.shape == (2, 40)
     assert all(dtype == np.dtype("float32") for dtype in result.dtypes)
 
 
-def test_strict_schema_rejects_missing_feature():
+def test_universal_ingest_zero_pads_missing_features_and_drops_extras():
     frame = valid_frame().drop(columns=["feature_03"])
-    with pytest.raises(ValueError, match="missing required features"):
-        app.validate_input_frame(frame, feature_names())
-
-
-def test_strict_schema_rejects_extra_label_column():
-    frame = valid_frame()
     frame["Label"] = "BENIGN"
-    with pytest.raises(ValueError, match="unexpected columns"):
-        app.validate_input_frame(frame, feature_names())
+    frame["Source_IP"] = "192.0.2.1"
+    result = app.align_network_features(frame, feature_names())
+    assert list(result.columns) == feature_names()
+    assert "Label" not in result.columns
+    assert "Source_IP" not in result.columns
+    assert (result["feature_03"] == 0).all()
 
 
-def test_strict_schema_rejects_duplicate_names_after_normalization():
+def test_universal_ingest_rejects_duplicate_names_after_normalization():
     frame = valid_frame()
     frame["feature 00"] = frame["feature_00"]
-    with pytest.raises(ValueError, match="duplicate normalized columns"):
-        app.validate_input_frame(frame, feature_names())
+    with pytest.raises(ValueError, match="Duplicate columns after normalization"):
+        app.align_network_features(frame, feature_names())
 
 
 @pytest.mark.parametrize("bad_value", ["bad", np.nan, np.inf, -np.inf])
-def test_strict_schema_rejects_invalid_numeric_values(bad_value):
+def test_universal_ingest_replaces_invalid_feature_values_with_zero(bad_value):
     frame = valid_frame()
     frame["feature_02"] = frame["feature_02"].astype(object)
     frame.loc[0, "feature_02"] = bad_value
-    with pytest.raises(ValueError, match="non-numeric, missing, or infinite"):
-        app.validate_input_frame(frame, feature_names())
+    result = app.align_network_features(frame, feature_names())
+    assert result.loc[0, "feature_02"] == 0.0
 
 
-def test_row_limit_is_checked_before_inference():
-    with pytest.raises(ValueError, match="expected 1–1 data rows"):
-        app.validate_input_frame(valid_frame(rows=2), feature_names(), max_rows=1)
+def test_universal_ingest_row_limit_is_checked_before_inference():
+    with pytest.raises(ValueError, match="expected 1–1 rows"):
+        app.align_network_features(valid_frame(rows=2), feature_names(), max_rows=1)
 
 
 @pytest.mark.parametrize(
