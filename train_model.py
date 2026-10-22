@@ -110,9 +110,10 @@ def main() -> None:
     X = X[features]
 
     counts = np.bincount(labels)
-    stratify = labels if len(counts) and int(counts.min()) >= 2 else None
+    if not len(counts) or int(counts.min()) < 2:
+        parser.error("Each class needs at least two labeled rows for a stratified train/test split.")
     X_train, X_test, y_train, y_test = train_test_split(
-        X, labels, test_size=0.2, random_state=SEED, stratify=stratify
+        X, labels, test_size=0.2, random_state=SEED, stratify=labels
     )
     model = XGBClassifier(
         objective="multi:softprob", num_class=len(classes), n_estimators=args.trees,
