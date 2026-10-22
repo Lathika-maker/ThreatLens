@@ -521,6 +521,19 @@ def analyze_synthetic(bundle: dict[str, Any]) -> dict[str, Any]:
     return analyze_csv_in_chunks(io.StringIO(data.to_csv(index=False)), bundle, chunk_size=100)
 
 
+def clear_previous_analysis() -> None:
+    """Release the prior disk-backed result when starting a replacement analysis."""
+    previous = st.session_state.pop("threatlens_analysis", None)
+    st.session_state.pop("threatlens_reports", None)
+    if isinstance(previous, dict):
+        path = previous.get("output_path")
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def build_alert_report(row: pd.Series, bundle: dict[str, Any],
                        index: faiss.IndexFlatL2, ids: list[str],
                        embedder: SentenceTransformer) -> dict[str, Any]:
@@ -589,11 +602,13 @@ def main() -> None:
         st.stop()
 
     if run_synth:
+        clear_previous_analysis()
         with st.spinner("Creating and analyzing 500 synthetic network flows…"):
             state = analyze_synthetic(bundle)
             st.session_state["threatlens_analysis"] = state
             st.session_state["threatlens_reports"] = None
     elif uploaded is not None and run_upload:
+        clear_previous_analysis()
         progress = st.progress(0, text="Starting CSV preprocessing…")
         try:
             with st.spinner("Streaming, preprocessing, and classifying CSV chunks locally…"):
