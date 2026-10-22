@@ -603,15 +603,16 @@ def main() -> None:
         st.caption("The current model uses seven fixed numerical features. Different schemas are not semantically interchangeable; zero-filled features should be reviewed before trusting the score.")
 
     output_path = state["output_path"]
-    try:
-        with open(output_path, "rb") as result_file:
-            output_bytes = result_file.read()
+    if os.path.isfile(output_path):
         st.download_button(
-            "Download full preprocessed predictions (CSV)", data=output_bytes,
-            file_name="threatlens_preprocessed_predictions.csv", mime="text/csv",
+            "Download full preprocessed predictions (CSV)",
+            data=lambda path=output_path: Path(path).read_bytes(),
+            file_name="threatlens_preprocessed_predictions.csv",
+            mime="text/csv",
+            help="The full output is read from disk only when the download is requested.",
         )
-    except OSError as exc:
-        st.error(f"Preprocessed output is no longer available: {exc}")
+    else:
+        st.error("Preprocessed output is no longer available. Please run the analysis again.")
 
     candidates = state["alerts"]
     if candidates.empty:
