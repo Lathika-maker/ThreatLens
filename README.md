@@ -26,7 +26,7 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app provides **Load Synthetic Attack Benchmark** (500 reproducible rows) and **Preprocess & Analyze CSV**. CSV rows are read in configurable chunks and predictions stream to a local temporary CSV. The UI keeps a 500-row preview and up to 200 high-scoring candidate alerts in memory, then computes SHAP/retrieval/quantum details for the top 50 alerts. The sidebar upload limit is configured to 1 GiB in `.streamlit/config.toml`; increase it there for larger local deployments if sufficient disk/RAM are available.
+The app provides **Load Synthetic Attack Benchmark** (500 reproducible rows) and **Preprocess & Analyze CSV**. CSV rows are read in configurable chunks and predictions stream to a local temporary CSV. The UI keeps a 500-row preview and up to 200 high-scoring candidate alerts in memory, then computes SHAP/retrieval details for the top 50 alerts. It executes the four-qubit simulation only for scores in the 0.40–0.65 interval, prioritizing borderline scores and limiting each upload to 1,000 simulations to protect throughput; diagnostics disclose eligible cases skipped after that cap. The sidebar upload limit is configured to 1 GiB in `.streamlit/config.toml`; increase it there for larger local deployments if sufficient disk/RAM are available.
 
 ## CSV preprocessing and schema compatibility
 
