@@ -641,44 +641,43 @@ def main() -> None:
     )
 
     if not preview_df.empty:
-        # Pandas Styler expands per-cell CSS and can exceed Streamlit's element limit on
-        # large CSVs. Apply red/green row styling to a bounded, useful preview; keep the
-        # complete dataset available in the native virtualized grid below.
+        # Keep one unified review table. Pandas Styler creates per-cell CSS and can
+        # exceed Streamlit's rendering limit for large uploads, so style a bounded
+        # head and use Streamlit's native virtualized dataframe for the full dataset.
         STYLE_PREVIEW_ROWS = 1000
-        styled_preview = preview_df.head(STYLE_PREVIEW_ROWS).copy()
 
         def _flow_row_style(row):
             category = str(row.get("Threat Category", "Unknown / Requires validation"))
             status = str(row.get("Analysis Status", ""))
             if status != "Analyzed":
-                background, foreground = "#332b16", "#f6d365"  # not analyzed / amber
+                background, foreground = "#332b16", "#f6d365"
             elif category == "Benign":
-                background, foreground = "#163d2b", "#d8ffe8"  # benign / green
+                background, foreground = "#163d2b", "#d8ffe8"
             else:
-                background, foreground = "#5b2028", "#ffe4e6"  # malicious / red
+                background, foreground = "#5b2028", "#ffe4e6"
             return [f"background-color: {background}; color: {foreground};" for _ in row]
 
         st.markdown("**Threat coloring:** 🟩 Benign · 🟥 Malicious / requires validation · 🟨 Not analyzed")
-        st.dataframe(
-            styled_preview.style.apply(_flow_row_style, axis=1),
-            use_container_width=True,
-            height=400,
-            hide_index=True,
-        )
-        if len(preview_df) > STYLE_PREVIEW_ROWS:
-            with st.expander(f"View remaining full dataset ({len(preview_df) - STYLE_PREVIEW_ROWS:,} additional rows)"):
-                st.dataframe(
-                    preview_df.iloc[STYLE_PREVIEW_ROWS:],
-                    use_container_width=True,
-                    height=400,
-                    hide_index=True,
-                )
+        # Display one table only: the first 1,000 rows are styled; the rest are
+        # still present in this same table, but unstyled for scalability.
+        display_df = preview_df.copy()
+        styled_head = display_df.head(STYLE_PREVIEW_ROWS).style.apply(_flow_row_style, axis=1)
+        if len(display_df) <= STYLE_PREVIEW_ROWS:
+            st.dataframe(styled_head, use_container_width=True, height=400, hide_index=True)
+        else:
+            # Single continuous table and single scroll surface. Avoid Styler for the
+            # full dataset because it serializes CSS for every cell and can crash.
+            st.dataframe(display_df, use_container_width=True, height=400, hide_index=True)
+            st.caption(
+                f"Showing all {len(display_df):,} rows in one table. To avoid rendering "
+                f"errors on large CSVs, native table rendering is used instead of per-cell "
+                f"Styler colors above {STYLE_PREVIEW_ROWS:,} rows. Prediction labels and "
+                "Review Flag remain visible for every row."
+            )
         st.caption(
-            f"Rows are colored using model predictions for analyzed rows. The first "
-            f"{min(len(preview_df), STYLE_PREVIEW_ROWS):,} rows are color-coded; additional "
-            "rows remain available in the scrollable table. Green means predicted benign, "
-            "red means malicious or requiring validation, and amber means not analyzed. "
-            "Model scores are not proof of compromise; corroborate with independent telemetry."
+            "Green = predicted benign; red = malicious or requires validation; amber = "
+            "not analyzed because of the row limit. Model predictions are not proof of "
+            "compromise; corroborate with independent telemetry."
         )
 
     st.subheader("Triage Overview")
