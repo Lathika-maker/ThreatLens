@@ -134,104 +134,54 @@ def validate_input_frame(raw: pd.DataFrame, features: list[str], max_rows: int =
     return align_network_features(raw, features)
 
 
-# Replace each placeholder with the share ID from a Google Drive file link.
-# The Drive files must be accessible to the deployment service account/public-link policy.
-ARTIFACT_DRIVE_IDS = {
-    "artifacts/xgboost_model.joblib": "REPLACE_WITH_GDRIVE_ID",
-    "artifacts/isolation_forest.joblib": "REPLACE_WITH_GDRIVE_ID",
-    "artifacts/label_encoder.joblib": "REPLACE_WITH_GDRIVE_ID",
-    "artifacts/imputer.joblib": "REPLACE_WITH_GDRIVE_ID",
-    "artifacts/scaler.joblib": "REPLACE_WITH_GDRIVE_ID",
-    "artifacts/threat_vault.json": "REPLACE_WITH_GDRIVE_ID",
-    "artifacts/model_metadata.json": "REPLACE_WITH_GDRIVE_ID",
-}
-ARTIFACT_FILENAMES = tuple(Path(name).name for name in ARTIFACT_DRIVE_IDS)
-
-
-def ensure_artifacts_present() -> None:
-    """Download missing artifacts from Drive, or fail with an actionable error."""
-    missing = [
-        (relative_name, ARTIFACT_DIR / Path(relative_name).name, drive_id)
-        for relative_name, drive_id in ARTIFACT_DRIVE_IDS.items()
-        if not (ARTIFACT_DIR / Path(relative_name).name).is_file()
-    ]
-    if not missing:
-        return
-
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    with st.spinner("Downloading heavy enterprise model artifacts (>100MB) from secure cloud storage..."):
-        invalid_ids = [
-            name for name, _path, drive_id in missing
-            if not drive_id or drive_id.startswith("REPLACE_") or drive_id.strip() in {"", "YOUR_FILE_ID"}
-        ]
-        if invalid_ids:
-            raise RuntimeError(
-                "Google Drive IDs are still placeholders for: " + ", ".join(invalid_ids)
-            )
-        try:
-            import gdown
-        except ImportError as exc:
-            raise RuntimeError(
-                "gdown is not installed. Install dependencies from requirements.txt and redeploy."
-            ) from exc
-
-        failed = []
-        for relative_name, destination, drive_id in missing:
-            try:
-                result = gdown.download(
-                    id=drive_id,
-                    output=str(destination),
-                    quiet=False,
-                    fuzzy=True,
-                )
-                if not result or not destination.is_file() or destination.stat().st_size == 0:
-                    failed.append(relative_name)
-            except Exception:
-                failed.append(relative_name)
-        if failed:
-            for name in failed:
-                (ARTIFACT_DIR / Path(name).name).unlink(missing_ok=True)
-            raise RuntimeError("Google Drive download failed or returned empty files: " + ", ".join(failed))
+# Strict local-only artifact loading. No network/cloud download fallback.
+ARTIFACT_DIR = Path("./artifacts")
+ARTIFACT_FILENAMES = (
+    "xgboost_model.joblib", "isolation_forest.joblib", "label_encoder.joblib",
+    "imputer.joblib", "scaler.joblib", "threat_vault.json", "model_metadata.json",
+)
 
 
 @st.cache_resource(max_entries=1, show_spinner=False)
 def load_artifacts() -> dict[str, Any]:
-    ensure_artifacts_present()
-    paths = {
-        "model": ARTIFACT_DIR / "xgboost_model.joblib",
-        "ood": ARTIFACT_DIR / "isolation_forest.joblib",
-        "encoder": ARTIFACT_DIR / "label_encoder.joblib",
-        "imputer": ARTIFACT_DIR / "imputer.joblib",
-        "scaler": ARTIFACT_DIR / "scaler.joblib",
-        "vault": ARTIFACT_DIR / "threat_vault.json",
-        "metadata": ARTIFACT_DIR / "model_metadata.json",
-    }
-    missing = [str(p) for p in paths.values() if not p.is_file()]
+    """Load artifacts only from ./artifacts; never fetch missing files remotely."""
+    paths = {name: ARTIFACT_DIR / name for name in ARTIFACT_FILENAMES}
+    missing = [name for name, path in paths.items() if not path.is_file()]
     if missing:
-        raise FileNotFoundError("Missing trained artifacts after cloud retrieval: " + ", ".join(missing))
-    metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+        raise FileNotFoundError(
+            "Missing local artifact(s) in ./artifacts/: " + ", ".join(missing)
+            + ". Run `python train_model.py --data-dir ./CICIDS2017 --output-dir ./artifacts` "
+              "to generate the local artifacts. No remote retrieval was attempted."
+        )
+
+    # Explicit local paths make artifact provenance auditable.
+    xgboost_model = joblib.load("./artifacts/xgboost_model.joblib")
+    isolation_forest = joblib.load("./artifacts/isolation_forest.joblib")
+    label_encoder = joblib.load("./artifacts/label_encoder.joblib")
+    imputer = joblib.load("./artifacts/imputer.joblib")
+    scaler = joblib.load("./artifacts/scaler.joblib")
+    threat_vault = json.loads(paths["threat_vault.json"].read_text(encoding="utf-8"))
+    metadata = json.loads(paths["model_metadata.json"].read_text(encoding="utf-8"))
+
     features = metadata.get("feature_columns")
     if not isinstance(features, list) or len(features) != MAX_FEATURES:
         raise ValueError(f"model_metadata.json must define exactly {MAX_FEATURES} feature_columns.")
     features = [normalize_column(x) for x in features]
     if len(set(features)) != len(features):
         raise ValueError("Feature metadata contains duplicate names after normalization.")
-    model, ood = joblib.load(paths["model"]), joblib.load(paths["ood"])
-    encoder, imputer = joblib.load(paths["encoder"]), joblib.load(paths["imputer"])
-    scaler = joblib.load(paths["scaler"])
-    threat_vault = json.loads(paths["vault"].read_text(encoding="utf-8"))
     for class_name, vector in threat_vault.items():
         values = np.asarray(vector, dtype=float)
         if values.shape != (MAX_FEATURES,) or not np.isfinite(values).all():
             raise ValueError(f"Invalid Threat Vault prototype for {class_name!r}: expected {MAX_FEATURES} finite values.")
-    if hasattr(model, "n_features_in_") and int(model.n_features_in_) != len(features):
+    if hasattr(xgboost_model, "n_features_in_") and int(xgboost_model.n_features_in_) != len(features):
         raise ValueError("XGBoost feature count differs from model metadata.")
-    if hasattr(ood, "n_features_in_") and int(ood.n_features_in_) != len(features):
+    if hasattr(isolation_forest, "n_features_in_") and int(isolation_forest.n_features_in_) != len(features):
         raise ValueError("Isolation Forest feature count differs from model metadata.")
-    return {"model": model, "ood": ood, "encoder": encoder, "imputer": imputer,
-            "scaler": scaler, "vault": threat_vault,
-            "metadata": metadata, "features": features}
-
+    return {
+        "model": xgboost_model, "ood": isolation_forest, "encoder": label_encoder,
+        "imputer": imputer, "scaler": scaler, "vault": threat_vault,
+        "metadata": metadata, "features": features,
+    }
 
 @st.cache_resource(max_entries=1, show_spinner=False)
 def load_embedder():
@@ -362,9 +312,9 @@ def main() -> None:
         bundle, artifact_error = None, str(exc)
 
     if bundle is None:
-        st.error("Model artifacts not found. Please run train_model.py locally and commit the exported models to the repository.")
+        st.error("Required local model artifacts are missing or invalid in ./artifacts/. Run train_model.py to generate the local artifacts. No remote retrieval was attempted.")
         if artifact_error:
-            st.caption(f"Artifact recovery detail: {safe_text(artifact_error, 500)}")
+            st.caption(f"Local artifact loading detail: {safe_text(artifact_error, 500)}")
         st.stop()
 
     supabase = get_supabase_client()
