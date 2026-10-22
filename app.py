@@ -362,16 +362,33 @@ def car_response_plan(attack: str, severity_value: str, is_ood: bool) -> dict[st
     return {"Contain": contain, "Analyze": analyze, "Remediate": remediate}
 
 
+def get_soc_ledger_path() -> Path:
+    """Use a stable path beside app.py, regardless of Streamlit's working directory."""
+    return Path(__file__).resolve().parent / "soc_ledger.csv"
+
+
 def append_soc_ledger(alert_id: str, threat_class: str, severity_value: str) -> Path:
     """Append minimal incident metadata locally; raw telemetry is never written."""
-    ledger_path = Path("soc_ledger.csv")
-    row = pd.DataFrame([{"Alert ID": safe_text(alert_id, 40),
-                         "Threat Class": safe_text(threat_class, 80),
-                         "Severity": safe_text(severity_value, 40),
-                         "Timestamp": datetime.now(timezone.utc).isoformat()}])
-    row.to_csv(ledger_path, mode="a",
-              header=not ledger_path.exists() or ledger_path.stat().st_size == 0,
-              index=False, encoding="utf-8")
+    ledger_path = get_soc_ledger_path()
+    columns = ["Alert ID", "Threat Class", "Severity", "Timestamp"]
+    row = pd.DataFrame([{
+        "Alert ID": safe_text(alert_id, 40),
+        "Threat Class": safe_text(threat_class, 80),
+        "Severity": safe_text(severity_value, 40),
+        "Timestamp": datetime.now(timezone.utc).isoformat(),
+    }], columns=columns)
+
+    # Create the ledger with a header on first use, then append subsequent records.
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    needs_header = not ledger_path.exists() or ledger_path.stat().st_size == 0
+    row.to_csv(
+        ledger_path,
+        mode="a",
+        header=needs_header,
+        index=False,
+        encoding="utf-8",
+        columns=columns,
+    )
     return ledger_path
 
 
@@ -785,7 +802,8 @@ def main() -> None:
             st.dataframe(view, use_container_width=True, hide_index=True)
             st.caption("No class is assigned to OOD rows. Investigate using independent telemetry.")
     with ledger_tab:
-        ledger_path = Path("soc_ledger.csv")
+        ledger_path = get_soc_ledger_path()
+        st.caption(f"Local ledger file: `{ledger_path}`")
         if ledger_path.exists() and ledger_path.stat().st_size > 0:
             try:
                 ledger_df = pd.read_csv(ledger_path)
