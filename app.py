@@ -386,21 +386,25 @@ def deterministic_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> s
 
 
 @st.cache_resource(max_entries=1, show_spinner=False)
-def load_flan_t5_pipeline():
-    """Load FLAN-T5 only after an explicit user request; cache it for reuse."""
-    from transformers import pipeline
+def load_flan_t5_model():
+    """Load and dynamically quantize FLAN-T5 for CPU inference on demand."""
+    from transformers import T5ForConditionalGeneration, T5Tokenizer
 
-    return pipeline(
-        "text2text-generation",
-        model="google/flan-t5-small",
-        tokenizer="google/flan-t5-small",
-        model_kwargs={"low_cpu_mem_usage": True},
-        device=-1,
+    tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-small")
+    model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-small")
+    model.eval()
+    quantized_model = torch.quantization.quantize_dynamic(
+        model,
+        {torch.nn.Linear},
+        dtype=torch.qint8,
     )
+    del model
+    gc.collect()
+    return tokenizer, quantized_model
 
 
 def generate_ai_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str:
-    """Generate a short narrative from supplied evidence; caller handles failures."""
+    """Generate a short evidence-grounded narrative with a cached INT8 CPU model."""
     facts = deterministic_narrative(row, evidence)
     prompt = (
         "Write a concise SOC triage explanation using ONLY the evidence below. "
@@ -408,15 +412,21 @@ def generate_ai_narrative(row: pd.Series, evidence: list[dict[str, Any]]) -> str
         "State that SHAP shows model contribution, not causation. If evidence is insufficient, say so.\n\n"
         + facts
     )
-    # Keep CPU decoding bounded; inference_mode avoids unnecessary autograd state.
+    tokenizer, quantized_model = load_flan_t5_model()
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    )
     with torch.inference_mode():
-        result = load_flan_t5_pipeline()(
-            prompt,
+        output_ids = quantized_model.generate(
+            **inputs,
             max_new_tokens=64,
             do_sample=False,
-            truncation=True,
+            num_beams=1,
         )
-    generated = str(result[0]["generated_text"]).strip()
+    generated = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
     if not generated:
         raise ValueError("FLAN-T5 returned an empty narrative.")
     return generated
