@@ -46,6 +46,11 @@ def normalize_column(value: object) -> str:
     return re.sub(r"\s+", "_", value)
 
 
+def normalize(value: object) -> str:
+    """Backward-compatible alias used by schema tests and utility callers."""
+    return normalize_column(value)
+
+
 def canonicalize_label(value: object) -> str:
     """Map CICIDS spellings to stable names expected by app.py / MITRE_MAP."""
     raw = str(value).replace("\ufffd", "-").replace("–", "-").replace("—", "-").strip()
