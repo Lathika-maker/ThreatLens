@@ -7,6 +7,7 @@ import os
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 import app
 
@@ -114,16 +115,25 @@ def test_deterministic_narrative_uses_shap_evidence():
     assert "SHAP describes model influence, not causation" in narrative
 
 
-def test_generate_ai_narrative_uses_cached_pipeline_and_bounded_generation(monkeypatch):
+def test_generate_ai_narrative_uses_quantized_model_and_bounded_generation(monkeypatch):
     calls = {}
 
-    class FakePipeline:
+    class FakeTokenizer:
         def __call__(self, prompt, **kwargs):
             calls["prompt"] = prompt
-            calls["kwargs"] = kwargs
-            return [{"generated_text": "Review the flow alongside related telemetry."}]
+            calls["tokenizer_kwargs"] = kwargs
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
 
-    monkeypatch.setattr(app, "load_flan_t5_pipeline", lambda: FakePipeline())
+        def decode(self, token_ids, **kwargs):
+            calls["decode_kwargs"] = kwargs
+            return "Review the flow alongside related telemetry."
+
+    class FakeModel:
+        def generate(self, **kwargs):
+            calls["generation_kwargs"] = kwargs
+            return torch.tensor([[4, 5, 6]])
+
+    monkeypatch.setattr(app, "load_flan_t5_model", lambda: (FakeTokenizer(), FakeModel()))
     row = pd.Series({"Prediction_Label": "MALICIOUS", "Threat_Probability": 0.87})
     evidence = [
         {"feature": "Destination_Port", "feature_value": 443, "shap_value": 0.31, "absolute_shap": 0.31},
@@ -131,17 +141,26 @@ def test_generate_ai_narrative_uses_cached_pipeline_and_bounded_generation(monke
     narrative = app.generate_ai_narrative(row, evidence)
     assert narrative == "Review the flow alongside related telemetry."
     assert "Destination_Port = 443" in calls["prompt"]
-    assert calls["kwargs"]["max_new_tokens"] == 64
-    assert calls["kwargs"]["do_sample"] is False
-    assert calls["kwargs"]["truncation"] is True
+    assert calls["tokenizer_kwargs"]["return_tensors"] == "pt"
+    assert calls["generation_kwargs"]["max_new_tokens"] == 64
+    assert calls["generation_kwargs"]["do_sample"] is False
+    assert calls["generation_kwargs"]["num_beams"] == 1
+    assert calls["decode_kwargs"]["skip_special_tokens"] is True
 
 
 def test_generate_ai_narrative_rejects_empty_model_output(monkeypatch):
-    class EmptyPipeline:
+    class EmptyTokenizer:
         def __call__(self, prompt, **kwargs):
-            return [{"generated_text": "   "}]
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
 
-    monkeypatch.setattr(app, "load_flan_t5_pipeline", lambda: EmptyPipeline())
+        def decode(self, token_ids, **kwargs):
+            return "   "
+
+    class FakeModel:
+        def generate(self, **kwargs):
+            return torch.tensor([[4, 5, 6]])
+
+    monkeypatch.setattr(app, "load_flan_t5_model", lambda: (EmptyTokenizer(), FakeModel()))
     row = pd.Series({"Prediction_Label": "BENIGN", "Threat_Probability": 0.12})
     with pytest.raises(ValueError, match="empty narrative"):
         app.generate_ai_narrative(row, [])
