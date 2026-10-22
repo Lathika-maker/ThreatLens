@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Train the ThreatLens CICIDS2017 multiclass and out-of-distribution models.
 
-Examples:
-  python train_model.py --data-dir ./dataset --output-dir artifacts
+Example:
   python train_model.py --data-dir . --output-dir artifacts
 
-Use a dedicated directory containing only CICIDS dataset files; do not point
---data-dir at the project root because recursive discovery can include .venv.
+Accepts Parquet dataset files. Environment and generated directories are excluded
+during recursive discovery.
 
 Accepts CSV and Parquet files. If both formats exist under the input directory,
 Parquet files are preferred to avoid training twice on duplicate exports.
@@ -56,43 +55,45 @@ def main() -> None:
 
     if not args.data_dir.is_dir():
         parser.error(f"Dataset directory does not exist: {args.data_dir}")
-    excluded_dirs = {".venv", "venv", "node_modules", ".git", "__pycache__", ".pytest_cache", "site-packages", "artifacts"}
+
+    # Search only for Parquet files. Exclude virtual environments and generated files
+    # so package test datasets are never mistaken for CICIDS2017 input.
+    excluded_dirs = {
+        ".venv", "venv", "node_modules", ".git", "__pycache__",
+        ".pytest_cache", "site-packages", "artifacts",
+    }
+
     def is_allowed_dataset_file(path: Path) -> bool:
         try:
             relative_parts = path.relative_to(args.data_dir).parts[:-1]
         except ValueError:
             return False
-        return not any(part in excluded_dirs or part.startswith(".") for part in relative_parts)
+        return not any(
+            part in excluded_dirs or part.startswith(".")
+            for part in relative_parts
+        )
 
-    parquet_files = sorted(path for path in args.data_dir.rglob("*.parquet") if is_allowed_dataset_file(path))
-    csv_files = sorted(path for path in args.data_dir.rglob("*.csv") if is_allowed_dataset_file(path))
-    # These CICIDS files are commonly distributed as Parquet. Prefer one format
-    # if both are present so the same observations are not accidentally duplicated.
-    files = parquet_files if parquet_files else csv_files
+    files = sorted(
+        path
+        for path in args.data_dir.rglob("*.parquet")
+        if is_allowed_dataset_file(path)
+    )
     if not files:
-        parser.error(f"No CSV or Parquet files found under {args.data_dir}")
-    file_format = "Parquet" if parquet_files else "CSV"
-    print(f"Found {len(files)} {file_format} dataset file(s).", flush=True)
+        parser.error(f"No Parquet files found under {args.data_dir}")
+
+    print(f"Found {len(files)} Parquet dataset file(s).", flush=True)
 
     frames = []
-    for path in files:
-        print(f"Reading {path}", flush=True)
+    for file in files:
+        print(f"Reading {file}", flush=True)
         try:
-            frame = (
-                pd.read_parquet(path)
-                if path.suffix.lower() == ".parquet"
-                else pd.read_csv(path, low_memory=False, encoding="utf-8-sig")
-            )
-        except UnicodeDecodeError as exc:
-            parser.error(
-                f"Could not decode CSV {path} as UTF-8. Verify that this is a real CICIDS CSV "
-                f"(not a renamed Parquet file) and re-export it as UTF-8. Details: {exc}"
-            )
-        except (ValueError, OSError) as exc:
-            parser.error(f"Could not read dataset file {path}: {exc}")
-        frame.columns = [normalize(c) for c in frame.columns]
+            frame = pd.read_parquet(file)
+        except (ValueError, OSError, ImportError) as exc:
+            parser.error(f"Could not read Parquet file {file}: {exc}")
+        frame.columns = [normalize(column) for column in frame.columns]
         frames.append(frame)
 
+    # Preserve the CSV pipeline's combined-data behavior.
     data = pd.concat(frames, ignore_index=True, sort=False)
     label_col = next((c for c in data.columns if c.strip().lower() in TARGET_NAMES), None)
     if label_col is None:
