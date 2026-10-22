@@ -100,6 +100,53 @@ def test_shap_explanation_returns_top_three(bundle):
     assert all(item["absolute_shap"] >= 0 for item in explanation)
 
 
+def test_deterministic_narrative_uses_shap_evidence():
+    row = pd.Series({"Prediction_Label": "MALICIOUS", "Threat_Probability": 0.87})
+    evidence = [
+        {"feature": "Destination_Port", "feature_value": 443, "shap_value": 0.31, "absolute_shap": 0.31},
+        {"feature": "Flow_Duration", "feature_value": 12, "shap_value": -0.08, "absolute_shap": 0.08},
+    ]
+    narrative = app.deterministic_narrative(row, evidence)
+    assert "MALICIOUS" in narrative
+    assert "87.0%" in narrative
+    assert "Destination_Port = 443" in narrative
+    assert "SHAP +0.31" in narrative
+    assert "SHAP describes model influence, not causation" in narrative
+
+
+def test_generate_ai_narrative_uses_cached_pipeline_and_bounded_generation(monkeypatch):
+    calls = {}
+
+    class FakePipeline:
+        def __call__(self, prompt, **kwargs):
+            calls["prompt"] = prompt
+            calls["kwargs"] = kwargs
+            return [{"generated_text": "Review the flow alongside related telemetry."}]
+
+    monkeypatch.setattr(app, "load_flan_t5_pipeline", lambda: FakePipeline())
+    row = pd.Series({"Prediction_Label": "MALICIOUS", "Threat_Probability": 0.87})
+    evidence = [
+        {"feature": "Destination_Port", "feature_value": 443, "shap_value": 0.31, "absolute_shap": 0.31},
+    ]
+    narrative = app.generate_ai_narrative(row, evidence)
+    assert narrative == "Review the flow alongside related telemetry."
+    assert "Destination_Port = 443" in calls["prompt"]
+    assert calls["kwargs"]["max_new_tokens"] == 64
+    assert calls["kwargs"]["do_sample"] is False
+    assert calls["kwargs"]["truncation"] is True
+
+
+def test_generate_ai_narrative_rejects_empty_model_output(monkeypatch):
+    class EmptyPipeline:
+        def __call__(self, prompt, **kwargs):
+            return [{"generated_text": "   "}]
+
+    monkeypatch.setattr(app, "load_flan_t5_pipeline", lambda: EmptyPipeline())
+    row = pd.Series({"Prediction_Label": "BENIGN", "Threat_Probability": 0.12})
+    with pytest.raises(ValueError, match="empty narrative"):
+        app.generate_ai_narrative(row, [])
+
+
 def test_quantum_score_is_mapped_to_zero_one(bundle):
     sample, _ = app.preprocess_network_chunk(app.generate_synthetic_data(10))
     predicted = app.predict_chunk(sample, bundle)
