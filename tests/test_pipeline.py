@@ -108,7 +108,7 @@ def test_quantum_score_is_mapped_to_zero_one(bundle):
 
 
 def test_chunked_csv_analysis_streams_all_rows_and_preserves_preview(bundle):
-    data = app.generate_synthetic_data(500)
+    data = app.generate_synthetic_data(500).drop(columns=["Flow_ID"])
     result = app.analyze_csv_in_chunks(io.StringIO(data.to_csv(index=False)), bundle, chunk_size=73)
     try:
         assert result["total_rows"] == 500
@@ -116,8 +116,9 @@ def test_chunked_csv_analysis_streams_all_rows_and_preserves_preview(bundle):
         assert len(result["alerts"]) <= 200
         on_disk = pd.read_csv(result["output_path"])
         assert len(on_disk) == 500
-        assert {"Prediction", "Threat_Probability", "Preprocessing_Warning",
+        assert {"Flow_ID", "Prediction", "Threat_Probability", "Preprocessing_Warning",
                 "Quantum_Eligible", "Quantum_Routed", "Quantum_Risk_Score"}.issubset(on_disk.columns)
+        assert on_disk["Flow_ID"].is_unique
         probabilities = on_disk["Threat_Probability"]
         in_interval = probabilities.between(app.EDGE_LOW, app.EDGE_HIGH)
         assert not (on_disk["Quantum_Routed"].astype(bool) & ~in_interval).any()
