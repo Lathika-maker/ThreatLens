@@ -75,6 +75,36 @@ def safe_text(value: Any, limit: int = 160) -> str:
     return "".join(ch for ch in str(value) if ch.isprintable())[:limit]
 
 
+def validate_input_frame(raw: pd.DataFrame, features: list[str], max_rows: int = MAX_ROWS) -> pd.DataFrame:
+    """Return a validated float32 matrix or raise ValueError without imputing data."""
+    frame = raw.copy()
+    frame.columns = [normalize_column(c) for c in frame.columns]
+    if frame.columns.duplicated().any():
+        duplicates = frame.columns[frame.columns.duplicated()].tolist()
+        raise ValueError("STRICT SCHEMA REJECTION: duplicate normalized columns: " + ", ".join(duplicates))
+    missing = [name for name in features if name not in frame.columns]
+    extra = [name for name in frame.columns if name not in features]
+    if missing or extra or len(frame.columns) != len(features):
+        detail = []
+        if missing:
+            detail.append("missing required features: " + ", ".join(missing))
+        if extra:
+            detail.append("unexpected columns: " + ", ".join(extra))
+        raise ValueError("STRICT SCHEMA REJECTION — no inference performed. " + " | ".join(detail))
+    if frame.empty or len(frame) > max_rows:
+        raise ValueError(f"Upload rejected: expected 1–{max_rows:,} data rows; got {len(frame):,}.")
+    matrix = frame[features].copy()
+    for name in features:
+        matrix[name] = pd.to_numeric(matrix[name], errors="coerce")
+    matrix = matrix.replace([np.inf, -np.inf], np.nan)
+    invalid = matrix.isna().sum()
+    invalid = invalid[invalid > 0]
+    if not invalid.empty:
+        detail = ", ".join(f"{name}={int(count)}" for name, count in invalid.items())
+        raise ValueError("STRICT DATA REJECTION — non-numeric, missing, or infinite values: " + detail)
+    return matrix.astype(np.float32)
+
+
 @st.cache_resource(max_entries=1, show_spinner=False)
 def load_artifacts() -> dict[str, Any]:
     paths = {
@@ -250,35 +280,12 @@ def main() -> None:
     except Exception as exc:
         st.error(f"CSV parsing failed: {safe_text(exc)}")
         st.stop()
-    raw.columns = [normalize_column(c) for c in raw.columns]
-    if raw.columns.duplicated().any():
-        st.error("STRICT SCHEMA REJECTION: duplicate column names after normalization.")
-        st.stop()
-    missing = [name for name in features if name not in raw.columns]
-    extra = [name for name in raw.columns if name not in features]
-    if missing or extra or len(raw.columns) != len(features):
-        st.error("STRICT SCHEMA REJECTION — no inference performed.")
-        if missing:
-            st.write("Missing required features:", missing)
-        if extra:
-            st.write("Unexpected columns:", extra)
+    try:
+        X = validate_input_frame(raw, features)
+    except ValueError as exc:
+        st.error(str(exc))
         st.caption("Select exactly the 40 features in model_metadata.json. The app never zero-fills or guesses missing measurements.")
         st.stop()
-    if raw.empty or len(raw) > MAX_ROWS:
-        st.error(f"Upload rejected: expected 1–{MAX_ROWS:,} data rows; got {len(raw):,}.")
-        st.stop()
-
-    X = raw[features].copy()
-    for name in features:
-        X[name] = pd.to_numeric(X[name], errors="coerce")
-    X = X.replace([np.inf, -np.inf], np.nan)
-    invalid = X.isna().sum()
-    invalid = invalid[invalid > 0]
-    if not invalid.empty:
-        st.error("STRICT DATA REJECTION — non-numeric, missing, or infinite values: " +
-            ", ".join(f"{k}={int(v)}" for k, v in invalid.items()))
-        st.stop()
-    X = X.astype(np.float32)
 
     started = time.perf_counter()
     ood = np.asarray(bundle["ood"].predict(X)) == -1
