@@ -16,4 +16,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile Python sources
-        run: python -m py_compile app.py train_model.py
+        run: python -m py_compile app.py train_model.py prepare_inference_csv.py
