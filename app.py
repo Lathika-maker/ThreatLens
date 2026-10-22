@@ -128,10 +128,30 @@ def align_network_features(uploaded_df: pd.DataFrame, expected_cols: list[str]) 
 
 
 def validate_input_frame(raw: pd.DataFrame, features: list[str], max_rows: int = MAX_ROWS) -> pd.DataFrame:
-    """Backward-compatible wrapper around universal feature alignment."""
-    if len(raw) > max_rows:
-        raise ValueError(f"Upload rejected: maximum is {max_rows:,} rows.")
-    return align_network_features(raw, features)
+    """Validate the exact trained feature schema without guessing or imputing uploads."""
+    frame = raw.copy()
+    frame.columns = [normalize_column(c) for c in frame.columns]
+    if frame.columns.duplicated().any():
+        duplicates = frame.columns[frame.columns.duplicated()].tolist()
+        raise ValueError("duplicate normalized columns: " + ", ".join(duplicates))
+    missing = [name for name in features if name not in frame.columns]
+    extra = [name for name in frame.columns if name not in features]
+    if missing or extra or len(frame.columns) != len(features):
+        details = []
+        if missing:
+            details.append("missing required features: " + ", ".join(missing))
+        if extra:
+            details.append("unexpected columns: " + ", ".join(extra))
+        raise ValueError("STRICT SCHEMA REJECTION — " + " | ".join(details))
+    if frame.empty or len(frame) > max_rows:
+        raise ValueError(f"Upload rejected: expected 1–{max_rows} data rows; got {len(frame)}.")
+    matrix = frame[features].copy()
+    for name in features:
+        matrix[name] = pd.to_numeric(matrix[name], errors="coerce")
+    matrix = matrix.replace([np.inf, -np.inf], np.nan)
+    if matrix.isna().any().any():
+        raise ValueError("non-numeric, missing, or infinite values in required features")
+    return matrix.astype(np.float32)
 
 
 # Strict local-only artifact loading. No network/cloud download fallback.
