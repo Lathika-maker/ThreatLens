@@ -31,7 +31,8 @@ st.set_page_config(page_title="ThreatLens | SOC Co-Pilot", page_icon="🛡️", 
 ARTIFACT_DIR = Path(os.getenv("THREATLENS_ARTIFACT_DIR", "artifacts"))
 MAX_FEATURES = 40
 MAX_UPLOAD_MB = 80
-MAX_ROWS = 100_000
+MAX_ROWS = 2_000_000
+DEFAULT_ANALYSIS_ROWS = 500_000
 MAX_ALERTS = 100
 SLM_MODEL_ID = "MBZUAI/LaMini-Flan-T5-77M"
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -317,11 +318,20 @@ def main() -> None:
     supabase = get_supabase_client()
     with st.sidebar:
         st.header("Data ingestion")
-        upload = st.file_uploader("Upload network-flow CSV (model expects 40 CICIDS-style features)", type=["csv"])
+        upload = st.file_uploader("Upload network-flow CSV", type=["csv"])
+        analysis_row_limit = st.slider(
+            "Rows to analyze",
+            min_value=10_000,
+            max_value=MAX_ROWS,
+            value=DEFAULT_ANALYSIS_ROWS,
+            step=10_000,
+            help="Choose how many rows from the beginning of the uploaded CSV to analyze. Extra columns are automatically removed and missing model features are zero-filled.",
+        )
+        st.caption("Columns are aligned automatically to the model's 40 features.")
         simulate_sqli = st.button("Simulate SQLi Attack", help="Generate a deterministic test row from the SQL Injection vault prototype.")
         simulate_xss = st.button("Simulate XSS Attack", help="Generate a deterministic test row from the XSS vault prototype.")
         test_mitre_pipeline = st.button("Test MITRE Pipeline", help="Run the end-to-end MITRE mapping smoke test using the SQL Injection prototype.")
-        st.caption(f"Upload limit {MAX_UPLOAD_MB} MB · {MAX_ROWS:,} rows")
+        st.caption(f"File limit {MAX_UPLOAD_MB} MB · up to {analysis_row_limit:,} rows per analysis")
         st.divider()
         st.subheader("System status")
         st.write(("🟢" if bundle else "🔴") + " Trained model artifacts")
@@ -357,7 +367,7 @@ def main() -> None:
         # Reconstruct raw values so the regular scaler/inference path recreates this prototype.
         mock_values = bundle["scaler"].inverse_transform(prototype)
         raw = pd.DataFrame(mock_values, columns=features)
-        X = validate_input_frame(raw, features, max_rows=1)
+        X = align_network_features(raw, features, max_rows=1)
         st.info(
             f"Simulation mode: one synthetic row reconstructed from the "
             f"{expected_simulation_label} Threat Vault prototype. This verifies "
@@ -379,10 +389,18 @@ def main() -> None:
             st.error(f"CSV parsing failed: {safe_text(exc)}")
             st.stop()
         try:
-            # Universal Ingest Layer: retain the model's exact feature order,
-            # discard unexpected columns, and zero-pad missing feature columns.
+            # Respect the user-selected row limit without rejecting larger CSVs.
+            # Analyze the first N rows; all columns still pass through universal alignment.
+            if len(raw) > analysis_row_limit:
+                st.warning(
+                    f"CSV contains {len(raw):,} rows. Analyzing the first "
+                    f"{analysis_row_limit:,} rows based on your slider setting."
+                )
+                raw = raw.head(analysis_row_limit).copy()
+
+            # Universal Ingest Layer: drop unexpected columns and zero-pad missing features.
             expected_features = features
-            X = align_network_features(raw, expected_features)
+            X = align_network_features(raw, expected_features, max_rows=analysis_row_limit)
         except ValueError as exc:
             st.error(f"CSV ingestion failed: {safe_text(exc)}")
             st.caption("Check the CSV encoding, duplicate normalized columns, and row count.")
