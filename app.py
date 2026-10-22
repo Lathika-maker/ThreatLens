@@ -102,34 +102,36 @@ def safe_text(value: Any, limit: int = 160) -> str:
     return "".join(ch for ch in str(value) if ch.isprintable())[:limit]
 
 
-def validate_input_frame(raw: pd.DataFrame, features: list[str], max_rows: int = MAX_ROWS) -> pd.DataFrame:
-    """Return a validated float32 matrix or raise ValueError without imputing data."""
-    frame = raw.copy()
+def align_network_features(uploaded_df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
+    """Align a network CSV to the model schema and return finite float32 features.
+
+    This is schema alignment, not semantic feature translation: zero-padding a
+    missing CICIDS feature does not make an unrelated dataset (e.g. UNSW-NB15)
+    statistically equivalent to CICIDS2017. Use only with a documented mapping
+    or treat results from foreign schemas as exploratory.
+    """
+    frame = uploaded_df.copy()
     frame.columns = [normalize_column(c) for c in frame.columns]
     if frame.columns.duplicated().any():
         duplicates = frame.columns[frame.columns.duplicated()].tolist()
-        raise ValueError("STRICT SCHEMA REJECTION: duplicate normalized columns: " + ", ".join(duplicates))
-    missing = [name for name in features if name not in frame.columns]
-    extra = [name for name in frame.columns if name not in features]
-    if missing or extra or len(frame.columns) != len(features):
-        detail = []
-        if missing:
-            detail.append("missing required features: " + ", ".join(missing))
-        if extra:
-            detail.append("unexpected columns: " + ", ".join(extra))
-        raise ValueError("STRICT SCHEMA REJECTION — no inference performed. " + " | ".join(detail))
-    if frame.empty or len(frame) > max_rows:
-        raise ValueError(f"Upload rejected: expected 1–{max_rows:,} data rows; got {len(frame):,}.")
-    matrix = frame[features].copy()
-    for name in features:
-        matrix[name] = pd.to_numeric(matrix[name], errors="coerce")
-    matrix = matrix.replace([np.inf, -np.inf], np.nan)
-    invalid = matrix.isna().sum()
-    invalid = invalid[invalid > 0]
-    if not invalid.empty:
-        detail = ", ".join(f"{name}={int(count)}" for name, count in invalid.items())
-        raise ValueError("STRICT DATA REJECTION — non-numeric, missing, or infinite values: " + detail)
-    return matrix.astype(np.float32)
+        raise ValueError("Duplicate columns after normalization: " + ", ".join(duplicates))
+    if frame.empty or len(frame) > MAX_ROWS:
+        raise ValueError(f"Upload rejected: expected 1–{MAX_ROWS:,} rows; got {len(frame):,}.")
+    # Discard labels, identifiers, and foreign columns; preserve only exact expected names.
+    aligned = frame.reindex(columns=expected_cols, fill_value=0)
+    for name in expected_cols:
+        aligned[name] = pd.to_numeric(aligned[name], errors="coerce")
+    aligned = aligned.replace([np.inf, -np.inf], np.nan)
+    # Invalid values in present features become zero so a malformed cell cannot crash scaler.
+    aligned = aligned.fillna(0)
+    return aligned.astype(np.float32)
+
+
+def validate_input_frame(raw: pd.DataFrame, features: list[str], max_rows: int = MAX_ROWS) -> pd.DataFrame:
+    """Backward-compatible wrapper around universal feature alignment."""
+    if len(raw) > max_rows:
+        raise ValueError(f"Upload rejected: maximum is {max_rows:,} rows.")
+    return align_network_features(raw, features)
 
 
 # Replace each placeholder with the share ID from a Google Drive file link.
@@ -368,7 +370,7 @@ def main() -> None:
     supabase = get_supabase_client()
     with st.sidebar:
         st.header("Data ingestion")
-        upload = st.file_uploader("Upload CSV with exactly the 40 trained features", type=["csv"])
+        upload = st.file_uploader("Upload network-flow CSV (model expects 40 CICIDS-style features)", type=["csv"])
         simulate_sqli = st.button("Simulate SQLi Attack", help="Generate a deterministic test row from the SQL Injection vault prototype.")
         simulate_xss = st.button("Simulate XSS Attack", help="Generate a deterministic test row from the XSS vault prototype.")
         test_mitre_pipeline = st.button("Test MITRE Pipeline", help="Run the end-to-end MITRE mapping smoke test using the SQL Injection prototype.")
@@ -419,7 +421,7 @@ def main() -> None:
             cards = st.columns(4)
             for col, label in zip(cards, ["Total Flows", "Threats", "OOD Anomalies", "Mean Triage Time"]):
                 col.metric(label, "—")
-            st.info("Upload a prepared CSV containing exactly the 40 feature columns from model_metadata.json, or use the sidebar simulation button. Do not include Label, IP, timestamp, or unrelated columns.")
+            st.info("Upload a network-flow CSV. Features are aligned by exact column name; missing model features are zero-padded and unknown columns are ignored. This does not semantically translate foreign dataset features.")
             st.stop()
         if upload.size > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"Upload rejected: file exceeds {MAX_UPLOAD_MB} MB.")
@@ -433,7 +435,7 @@ def main() -> None:
             X = validate_input_frame(raw, features)
         except ValueError as exc:
             st.error(str(exc))
-            st.caption("Select exactly the 40 features in model_metadata.json. The app never zero-fills or guesses missing measurements.")
+            st.caption("Check the CSV encoding, duplicate columns, and numeric feature values.")
             st.stop()
 
     started = time.perf_counter()
@@ -532,9 +534,12 @@ def main() -> None:
                         st.markdown("**Prediction evidence**")
                         st.write(f"Class: **{attack}**")
                         if vault_hit[pos]:
-                            st.write(f"Threat Vault cosine similarity: **{vault_similarities[pos] * 100:.2f}%**")
+                            confidence_pct = float(np.clip(vault_similarities[pos], 0.0, 1.0))
+                            st.write(f"Threat Vault cosine similarity: **{confidence_pct * 100:.2f}%**")
                         else:
-                            st.write(f"XGBoost class confidence: **{confidence[pos] * 100:.1f}%**")
+                            confidence_pct = float(np.clip(confidence[pos], 0.0, 1.0)) if np.isfinite(confidence[pos]) else 0.0
+                            st.write(f"XGBoost class confidence: **{confidence_pct * 100:.1f}%**")
+                        st.progress(confidence_pct, text="Similarity / model score (not calibrated probability)")
                         st.write(evidence)
                         if items:
                             st.bar_chart(pd.DataFrame(items).set_index("feature")[["impact"]])
@@ -552,8 +557,9 @@ def main() -> None:
                         st.markdown(f"**MITRE ATT&CK tactic:** {mitre.get('tactic', DEFAULT_ATTACK['tactic'])}")
                         st.markdown(f"**MITRE ATT&CK technique:** {mitre.get('technique', DEFAULT_ATTACK['technique'])}")
                         st.write(mitre.get("description", DEFAULT_ATTACK["description"]))
-                        st.markdown("**Suggested defensive validation / mitigation**")
-                        st.write(mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
+                        with st.expander("Suggested defensive validation / mitigation", expanded=True):
+                            st.write(mitre.get("mitigation", DEFAULT_ATTACK["mitigation"]))
+                            st.caption("Validate these steps against your environment and independent telemetry before taking containment action.")
                         if st.button("Save metadata to SOC Ledger", key=f"save-{alert_ids[pos]}"):
                             if supabase is None:
                                 st.error("Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in Streamlit secrets.")
