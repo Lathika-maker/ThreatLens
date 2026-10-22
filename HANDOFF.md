@@ -1,36 +1,34 @@
 # ThreatLens handoff
 
-## Current implementation
+## Current branch change
 
-The application is a single-file Streamlit dashboard in `app.py`. Its model input is the fixed `FEATURES` list; `Label`, `Flow_ID`, and IPs remain context only. Class labels are `BENIGN`, `PortScan`, `DDoS`, `BruteForce`, and `PrivilegeAnomaly`.
+Branch `feature/chunked-csv-preprocessing` refactors the app to the requested **ThreatLens: Hybrid Quantum-Classical AI Co-Pilot for Explainable Threat Triage** demo. The existing `main` branch was preserved for review. The branch adds an XGBoost binary classifier, SHAP explanations, a PennyLane `default.qubit` edge-case score, local MiniLM + FAISS retrieval, and chunked network CSV processing.
 
-The embedded `THREAT_INTEL` dictionary contains exactly T1046, T1110, T1071, T1499, T1190, and T1078. `CLASS_TO_TECHNIQUE` maps PortScan to T1046, BruteForce to T1110, DDoS to T1499, and PrivilegeAnomaly to T1078. The classifier mapping stays primary for those known classes; FAISS nearest ID and L2 distance are preserved as supporting retrieval output if they disagree.
+## Pipeline and constraints
 
-Synthetic input is produced by `generate_flows(n_per_class=1500, seed=42)`: 2,500 BENIGN flows and 1,500 per attack class, with seeded cross-class feature noise and recomputed packet rates. `train_model()` uses a stratified 75/25 split, random state 42, and a 100-tree Random Forest with max depth 12. Its hold-out accuracy on this run was **93.6471%** (0.936471); this is synthetic-data pipeline validation, not real traffic performance.
+- `FEATURES`: `Destination_Port`, `Flow_Duration`, `Total_Fwd_Packets`, `Total_Bwd_Packets`, `Flow_Bytes_s`, `Packet_Length_Mean`, `SYN_Flag_Count`.
+- `generate_synthetic_data()` builds a repeatable 500-row binary labeled benchmark; `train_model()` trains XGBoost on this synthetic data only. Uploaded `Label` values are never passed into model inference.
+- `preprocess_network_chunk()` normalizes common CICIDS/NetFlow/Zeek aliases, derives byte-rate/mean-packet-length measurements only when appropriate source columns exist, and reports missing features or invalid cells.
+- `analyze_csv_in_chunks()` streams parsing and inference in batches and writes complete output predictions to a temporary local CSV. The UI retains a 500-row preview and up to 200 candidate alerts, then generates detailed cards for the top 50. Streamlit upload ceiling is set to 1 GiB by `.streamlit/config.toml`.
+- `explain_flow()` ranks the top three absolute SHAP attributions.
+- The four-qubit PennyLane circuit runs only when the XGBoost score is in [0.40, 0.65]. Its fixed-parameter output is an exploratory score, not a calibrated probability or demonstrated quantum advantage.
+- The local FAISS index contains six curated ATT&CK entries and uses MiniLM 384-dimensional embeddings. Retrieval is supporting context only, not proof of a technique.
+- No cloud LLM/inference API is used for uploaded data. Hugging Face weights can be fetched once on first launch; after caching, `HF_HUB_OFFLINE=1` can force offline loading.
 
-## Functions in `app.py`
+## Important interpretation limits
 
-- `technique_text`, `_sample_range`, `generate_flows`
-- `load_embedder`, `build_vector_index`, `_model_matrix`, `_baseline_matrix`, `train_model`
-- `normalize_columns`, `prepare_uploaded_frame`, `load_uploaded_csv`
-- `predict_flows`, `_transformed_value`, `explain_flow`
-- `_behavior_phrase`, `build_query`, `retrieve_technique`
-- `generate_report`, `triage_flow`, `reports_to_frame`
-- `system_status`, `_style_flows`, `main`
+The model schema is fixed. Alias normalization helps with common exports, but arbitrary CSV columns do not become semantically compatible automatically. Missing numeric model features are zero-filled so preprocessing can continue, with warnings shown to users; predictions with missing or differently defined features may be unreliable. Flow-duration-based derivations assume microseconds as in CICIDS-style datasets.
 
-The embedder uses `sentence-transformers/all-MiniLM-L6-v2`; cached files live under `.cache/huggingface`, which is ignored by Git. `HF_HUB_OFFLINE=1` works after the model has been cached. CPU thread pools are limited to keep local encoding stable on Apple Silicon. PyArrow is constrained below 20 to remain compatible with NumPy 1.x.
+The synthetic benchmark is for pipeline demonstration, not real-world performance. Validate with representative labeled network data before making detection claims. The quantum circuit is a fixed-weight simulator demo, and not evidence of a practical quantum advantage. Triage cards assist a human analyst; ThreatLens does not auto-block traffic.
 
-Sidebar health flags are computed by `system_status()` from the trained model, actual FAISS dimensions/count, and loaded CPU embedder. Triage time starts at `time.perf_counter()` and covers evidence extraction, retrieval, and report creation for the rendered (up to 50 highest-confidence) alerts. It shows `N/A` when no alerts were triaged.
+## Verification status
 
-## Verification recorded
+The tests in `tests/test_pipeline.py` have been updated to cover schema normalization, preprocessing diagnostics and derivations, synthetic binary data, XGBoost predictions, SHAP feature attribution, quantum score range, and chunked output. **These updated tests still need to be run in the project environment after installing the updated `requirements.txt`; do not represent them as passing until that command succeeds.**
 
-- `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest -q`: **12 passed in 4.97 seconds**.
-- Streamlit `AppTest` loaded the app, clicked **Load Synthetic Network Logs**, and rendered four metrics and 50 alert cards without exceptions.
-- `HF_HUB_OFFLINE=1 .venv/bin/streamlit run app.py --server.headless true --server.port 8502`: server started; `/_stcore/health` returned `ok`; `/` returned HTTP 200; server was stopped.
-- Real MiniLM embeddings produced a 6 × 384 FAISS index. Each knowledge-base text retrieved its own entry at distance 0. The PortScan, DDoS, and BruteForce examples returned T1046, T1499, and T1110.
-- CSV ingestion tests confirm missing feature names are reported without raising and invalid numbers/infinities become zero.
-- `.venv/` is ignored by Git.
+Run locally:
 
-## Known verification limits
-
-No representative CICIDS2017 evaluation or live traffic capture was performed. A first-run model download from an empty cache was not part of the offline checks; the cached model was loaded and encoded successfully with `HF_HUB_OFFLINE=1`.
+```bash
+python -m pip install -r requirements.txt
+pytest -q tests/test_pipeline.py
+streamlit run app.py
+```
