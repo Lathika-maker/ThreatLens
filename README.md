@@ -1,63 +1,74 @@
-# ThreatLens | Hybrid SOC Co-Pilot
+# ThreatLens | Evidence-First SOC Co-Pilot
 
-ThreatLens is a local Streamlit proof-of-concept for explainable triage of network-flow CSVs. It combines XGBoost binary classification, SHAP feature attribution, a PennyLane four-qubit circuit for ambiguous model scores, and local MiniLM + FAISS retrieval over six curated MITRE ATT&CK entries.
+ThreatLens is a Streamlit prototype for explainable triage of CICIDS2017 network-flow records. Its inference pipeline uses locally trained multiclass XGBoost and Isolation Forest artifacts, per-alert SHAP feature attribution, a compact retrieval corpus for ATT&CK-informed investigation guidance, and optional evidence-grounded narrative generation.
 
-## Architecture
+## Current inference contract
 
-```text
-CSV upload → chunked normalization / feature derivation → XGBoost
-                                         ├── SHAP top-three evidence
-                                         ├── (0.40–0.65 score only) PennyLane default.qubit
-                                         └── MiniLM embeddings → local FAISS ATT&CK retrieval
-                                                ↓
-                              deterministic Streamlit SOC triage cards + local CSV output
-```
+- **Exactly 40 numeric input features.** The feature list comes from `artifacts/model_metadata.json`. Uploaded files containing missing, extra, duplicate, non-numeric, NaN, or infinite feature values are rejected before inference.
+- **OOD gate first.** Isolation Forest is applied to each row first. Rows flagged out-of-distribution are labeled `Unknown Novel Anomaly` and bypass XGBoost, SHAP, and ATT&CK retrieval.
+- **Explainability is evidence, not causation.** SHAP values describe feature contributions to a model output; they do not prove an attack or explain its real-world cause.
+- **ATT&CK mapping is contextual guidance.** Semantic similarity to the small curated reference corpus is not an attack probability or proof of attribution.
+- **Optional AI narrative.** The narrative model is loaded only on request and a RAM guard provides deterministic SHAP evidence as fallback.
+- **Privacy-aware incident ledger.** Supabase receives only allowlisted incident metadata. Raw CSV rows and full feature vectors are not sent to Supabase.
 
-No uploaded flow data is sent to a cloud LLM or remote inference API. The Sentence Transformers model weights may be downloaded from Hugging Face on first launch; cache them before running with `HF_HUB_OFFLINE=1` for offline use.
+## 1. Install
 
-## Run locally
-
-Python 3.11 is recommended, especially for scientific and quantum-simulation wheels.
+Python 3.11 or 3.12 is recommended.
 
 ```bash
-python3.11 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+## 2. Train locally
+
+Download CICIDS2017 from its official/public dataset source, extract its CSV files into a directory, and run:
+
+```bash
+python train_model.py --data-dir ./CICIDS2017 --output-dir artifacts
+```
+
+Training prints a classification report and writes these files:
+
+- `artifacts/xgboost_model.joblib`
+- `artifacts/isolation_forest.joblib`
+- `artifacts/label_encoder.joblib`
+- `artifacts/imputer.joblib`
+- `artifacts/model_metadata.json`
+
+The trainer excludes recognizable identifier/time columns, drops fields that contain no numeric measurements, selects the 40 most informative numeric features, and stores their exact names in metadata. Training is intended to happen locally, not while Streamlit is starting up.
+
+## 3. Prepare an inference CSV
+
+The app intentionally rejects the original unfiltered CICIDS2017 table if it contains label, IP, timestamp, or other columns beyond the 40 selected features. Create an inference CSV with **only** the 40 columns named in `artifacts/model_metadata.json`; preserve those names and numeric values exactly. Do not include the target label. The app does not fill absent fields with zeros.
+
+To inspect the expected schema after training:
+
+```bash
+python -c 'import json; print("\n".join(json.load(open("artifacts/model_metadata.json"))["feature_columns"]))'
+```
+
+## 4. Run the dashboard
+
+```bash
 streamlit run app.py
 ```
 
-The app provides **Load Synthetic Attack Benchmark** (500 reproducible rows) and **Preprocess & Analyze CSV**. CSV rows are read in configurable chunks and predictions stream to a local temporary CSV. The UI keeps a 500-row preview and up to 200 high-scoring candidate alerts in memory, then computes SHAP/retrieval details for the top 50 alerts. It executes the four-qubit simulation only for scores in the 0.40–0.65 interval, prioritizing borderline scores and limiting each upload to 1,000 simulations to protect throughput; diagnostics disclose eligible cases skipped after that cap. The sidebar upload limit is configured to 1 GiB in `.streamlit/config.toml`; increase it there for larger local deployments if sufficient disk/RAM are available.
+The app requires the trained `artifacts/` directory to be available in the runtime. For Streamlit Community Cloud, provide these artifacts securely as part of the deployment process; the app does not train models or fabricate model files when artifacts are missing. Do not commit the original CICIDS2017 dataset or private security telemetry to a public repository.
 
-## CSV preprocessing and schema compatibility
+## 5. Optional Supabase incident ledger
 
-ThreatLens normalizes common CICIDS-style, NetFlow-style, and some Zeek-style aliases for these seven model features:
+Add the following values to Streamlit secrets (locally, `.streamlit/secrets.toml`; on Community Cloud, the app's Secrets settings):
 
-- `Destination_Port`
-- `Flow_Duration`
-- `Total_Fwd_Packets`
-- `Total_Bwd_Packets`
-- `Flow_Bytes_s`
-- `Packet_Length_Mean`
-- `SYN_Flag_Count`
-
-It can derive mean packet length from directional means and approximate byte rate from directional byte counts plus flow duration. These derivations assume CICIDS-style flow duration measured in microseconds. Unavailable fields are filled with zero so files can be inspected, but the app displays a warning for each missing feature family and marks the row's preprocessing warning. **Arbitrary network CSVs are not semantically interchangeable**: predictions from a file with missing or differently defined fields may be unreliable. Review diagnostics and normalize source units before interpreting detections. Upload `Label` columns are retained as context only and never passed to the model.
-
-Chunked parsing and inference reduce peak working memory for data rows and write predictions to disk rather than holding every prediction in a single dataframe. Streamlit still receives the uploaded file and a local temporary output file is used; the UI does not promise unlimited data sizes. Monitor local storage and available memory for very large uploads.
-
-## Detection, explainability, and retrieval
-
-- **XGBoost:** a binary model trained on an internally generated 500-row synthetic benchmark. It predicts benign versus malicious; it is not trained from upload labels.
-- **SHAP:** ranks three features by absolute local SHAP value for a flagged flow. Values explain model-output attribution, not causation or attack probability.
-- **PennyLane:** a four-qubit `default.qubit` circuit receives four normalized features only when the XGBoost score is between 0.40 and 0.65 inclusive. The mapped score is an exploratory simulator signal, not a calibrated risk probability and does not override the classifier.
-- **MiniLM + FAISS:** encodes a six-entry curated ATT&CK knowledge base locally, retrieves a semantically close entry, and presents its tactics and three mitigation steps. A retrieval match is contextual guidance, not proof that the technique occurred.
-- **Streamlit:** shows dataset metrics, colored preview rows, preprocessing warnings, top alert cards, and a downloadable full processed CSV.
-
-## Evaluation limits
-
-The 500-row benchmark demonstrates the workflow, not real-world accuracy. Validate on representative datasets such as CICIDS2017/UNSW-NB15, check class-wise precision/recall, calibrate probability thresholds, and audit false positives before operational use. The quantum circuit is a fixed-parameter heuristic demonstration, not evidence of quantum advantage or a trained quantum classifier. ThreatLens supports human investigation; it does not autonomously confirm incidents or block traffic.
-
-## Tests
-
-```bash
-pytest -q tests/test_pipeline.py
+```toml
+SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"
+SUPABASE_KEY = "YOUR-SUPABASE-KEY"
 ```
+
+Create an `incident_ledger` table with columns matching `timestamp`, `alert_id`, `threat_class`, `top_shap_features` (JSON/JSONB), and `mitre_technique`. Use least-privilege credentials and avoid a privileged service-role key in client-facing configurations.
+
+## Limits and evaluation notes
+
+This is a prototype, not a production-certified SOC product. Model performance depends on the dataset, label quality, train/test split, and class distribution. Reported class confidence is the model's maximum class score, not necessarily a calibrated probability. OOD decisions depend on the fitted Isolation Forest. Validate precision, recall, false-positive rate, inference latency, and analyst effort on held-out and operationally representative data before using it for response decisions.
