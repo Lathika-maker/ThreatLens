@@ -83,15 +83,6 @@ def main() -> None:
     if X.shape[1] < 40:
         parser.error(f"Only {X.shape[1]} usable numeric features found; the app requires at least 40.")
 
-    imputer = SimpleImputer(strategy="median")
-    X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns).replace(
-        [np.inf, -np.inf], np.nan
-    )
-    # Reject any unexpected residual invalids rather than passing them to estimators.
-    if X.isna().any().any():
-        parser.error("Numeric preprocessing left missing values; inspect the source dataset.")
-    X = X.astype(np.float32)
-
     encoder = LabelEncoder()
     labels = encoder.fit_transform(y.astype(str))
     classes = [str(c) for c in encoder.classes_]
@@ -100,21 +91,41 @@ def main() -> None:
     if len(classes) != 15:
         print(f"WARNING: dataset has {len(classes)} classes, not 15: {classes}", flush=True)
 
+    counts = np.bincount(labels)
+    if not len(counts) or int(counts.min()) < 2:
+        parser.error("Each class needs at least two labeled rows for a stratified train/test split.")
+
+    # Split before fitting the imputer or feature selector to avoid hold-out leakage.
+    train_indices, test_indices = train_test_split(
+        np.arange(len(X)), test_size=0.2, random_state=SEED, stratify=labels
+    )
+    X_train_raw = X.iloc[train_indices].copy()
+    X_test_raw = X.iloc[test_indices].copy()
+    y_train, y_test = labels[train_indices], labels[test_indices]
+
+    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+    X_train_imputed = pd.DataFrame(
+        imputer.fit_transform(X_train_raw), columns=X.columns, index=X_train_raw.index
+    )
+    X_test_imputed = pd.DataFrame(
+        imputer.transform(X_test_raw), columns=X.columns, index=X_test_raw.index
+    )
+    if X_train_imputed.isna().any().any() or X_test_imputed.isna().any().any():
+        parser.error("Numeric preprocessing left missing values; inspect the source dataset.")
+    X_train_imputed = X_train_imputed.astype(np.float32)
+    X_test_imputed = X_test_imputed.astype(np.float32)
+
+    # Feature selection uses training rows and labels only.
     selector = ExtraTreesClassifier(
         n_estimators=100, class_weight="balanced", max_features="sqrt",
         n_jobs=max(1, min(4, os.cpu_count() or 1)), random_state=SEED,
     )
-    selector.fit(X, labels)
+    selector.fit(X_train_imputed, y_train)
     ranked = np.argsort(selector.feature_importances_)[::-1]
     features = [str(X.columns[i]) for i in ranked[:40]]
-    X = X[features]
+    X_train = X_train_imputed[features]
+    X_test = X_test_imputed[features]
 
-    counts = np.bincount(labels)
-    if not len(counts) or int(counts.min()) < 2:
-        parser.error("Each class needs at least two labeled rows for a stratified train/test split.")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, labels, test_size=0.2, random_state=SEED, stratify=labels
-    )
     model = XGBClassifier(
         objective="multi:softprob", num_class=len(classes), n_estimators=args.trees,
         max_depth=6, learning_rate=0.08, subsample=0.85, colsample_bytree=0.85,
@@ -123,13 +134,14 @@ def main() -> None:
     )
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
+    # Fit OOD detection on training rows only; hold-out metrics remain separate.
     rng = np.random.default_rng(SEED)
-    sample_idx = rng.choice(len(X), min(100_000, len(X)), replace=False)
+    sample_idx = rng.choice(len(X_train), min(100_000, len(X_train)), replace=False)
     ood = IsolationForest(
         n_estimators=150, contamination="auto", max_samples=min(2048, len(sample_idx)),
         n_jobs=max(1, min(4, os.cpu_count() or 1)), random_state=SEED,
     )
-    ood.fit(X.iloc[sample_idx])
+    ood.fit(X_train.iloc[sample_idx])
     print(classification_report(
         y_test, model.predict(X_test), labels=np.arange(len(classes)),
         target_names=classes, zero_division=0,
@@ -149,6 +161,9 @@ def main() -> None:
         "dataset": "CICIDS2017",
         "random_state": SEED,
         "schema_policy": "exact_40_numeric_features_no_zero_fill",
+        "train_rows": int(len(train_indices)),
+        "test_rows": int(len(test_indices)),
+        "feature_selection_fit": "training_partition_only",
     }
     (args.output_dir / "model_metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
