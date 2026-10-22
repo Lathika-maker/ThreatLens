@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Train the ThreatLens CICIDS2017 multiclass and out-of-distribution models.
 
-Example:
+Examples:
+  python train_model.py --data-dir . --output-dir artifacts
   python train_model.py --data-dir ./CICIDS2017 --output-dir artifacts
+
+Accepts CSV and Parquet files. If both formats exist under the input directory,
+Parquet files are preferred to avoid training twice on duplicate exports.
 
 Train locally on a machine with enough RAM. The Streamlit app consumes the saved
 artifacts and will reject inference datasets whose columns differ from metadata.
@@ -47,14 +51,22 @@ def main() -> None:
     parser.add_argument("--trees", type=int, default=350)
     args = parser.parse_args()
 
-    files = sorted(args.data_dir.rglob("*.csv")) if args.data_dir.is_dir() else []
+    if not args.data_dir.is_dir():
+        parser.error(f"Dataset directory does not exist: {args.data_dir}")
+    parquet_files = sorted(args.data_dir.rglob("*.parquet"))
+    csv_files = sorted(args.data_dir.rglob("*.csv"))
+    # These CICIDS files are commonly distributed as Parquet. Prefer one format
+    # if both are present so the same observations are not accidentally duplicated.
+    files = parquet_files if parquet_files else csv_files
     if not files:
-        parser.error(f"No CSV files found under {args.data_dir}")
+        parser.error(f"No CSV or Parquet files found under {args.data_dir}")
+    file_format = "Parquet" if parquet_files else "CSV"
+    print(f"Found {len(files)} {file_format} dataset file(s).", flush=True)
 
     frames = []
     for path in files:
         print(f"Reading {path}", flush=True)
-        frame = pd.read_csv(path, low_memory=False)
+        frame = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path, low_memory=False)
         frame.columns = [normalize(c) for c in frame.columns]
         frames.append(frame)
 
