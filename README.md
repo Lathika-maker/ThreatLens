@@ -21,11 +21,11 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Use **Load Synthetic Network Logs** for the reproducible demo or upload a CSV. The app retains the selected dataset across Streamlit reruns. Uploads replace common CICIDS column spacing and punctuation with underscores, validate all required features, coerce invalid numeric values, and replace infinities or missing measurements with zero.
+Use **Load Synthetic Network Logs** for the reproducible demo or upload a CSV. CSV parsing is configurable in chunks (10k–250k rows) and normalizes common CICIDS/NetFlow/Zeek-style field aliases. Where source fields exist, preprocessing can derive packet rate from packet counts and flow duration, or approximate byte rate from packet counts, mean packet size, and duration. Invalid, missing, and infinite required numeric cells are converted to zero and reported in the preprocessing summary. The cleaned data is retained in memory for the current dashboard, so chunked parsing reduces parser memory pressure but does not make the entire app out-of-core for arbitrarily large datasets.
 
 ## Data schema
 
-Required numeric columns: `Destination_Port`, `Flow_Duration`, `Total_Fwd_Packets`, `Total_Bwd_Packets`, `Flow_Bytes_s`, `Flow_Packets_s`, `Packet_Length_Mean`, and `SYN_Flag_Count`. `Label`, addresses, and IDs are never model inputs. Upload labels are retained as source context; predictions are generated independently. Missing or malformed numeric cells are converted to zero after coercion.
+Required model features after safe alias mapping/derivation: `Destination_Port`, `Flow_Duration`, `Total_Fwd_Packets`, `Total_Bwd_Packets`, `Flow_Bytes_s`, `Flow_Packets_s`, `Packet_Length_Mean`, and `SYN_Flag_Count`. Arbitrary CSVs are not automatically compatible: if these values cannot be mapped or derived, the app reports the missing fields rather than inventing values. The duration-based rate derivation assumes source flow duration is in microseconds (as in CICIDS-style flows). `Label`, addresses, and IDs are never model inputs. Upload labels are retained as source context; predictions are generated independently. Missing or malformed numeric cells are converted to zero after coercion.
 
 ## Model and triage
 
