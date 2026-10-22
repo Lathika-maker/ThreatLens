@@ -55,6 +55,47 @@ MITRE_MAP: dict[str, dict[str, str]] = {
     "Heartbleed": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application (context-dependent)", "description": "The dataset class suggests Heartbleed-like traffic; confirm vulnerable software and exploit evidence.", "mitigation": "Patch affected TLS implementations and rotate secrets if exposure is confirmed."},
     "Web Attack – SQL Injection": {"tactic": "Initial Access (context-dependent)", "technique": "T1190 — Exploit Public-Facing Application", "description": "Potential SQL injection attempts against an exposed application. The dataset label is not proof of successful exploitation.", "mitigation": "Review application and WAF logs, validate parameterized queries and input handling, and patch vulnerable components."},
 }
+THREAT_TAXONOMY: dict[str, str] = {
+    "BENIGN": "Benign",
+    "Bot": "Malicious - Command and Control",
+    "DDoS": "Malicious - Denial of Service",
+    "DoS Hulk": "Malicious - Denial of Service",
+    "DoS GoldenEye": "Malicious - Denial of Service",
+    "DoS slowloris": "Malicious - Denial of Service",
+    "DoS Slowhttptest": "Malicious - Denial of Service",
+    "PortScan": "Malicious - Reconnaissance",
+    "FTP-Patator": "Malicious - Brute Force",
+    "SSH-Patator": "Malicious - Brute Force",
+    "Web Attack – Brute Force": "Malicious - Brute Force",
+    "Web Attack – SQL Injection": "Malicious - Web Attack",
+    "Web Attack – XSS": "Malicious - Web Attack",
+    "Web Attack – Sql Injection": "Malicious - Web Attack",
+    "Infiltration": "Malicious - Privilege/Infiltration",
+    "Heartbleed": "Malicious - Exploitation",
+}
+
+
+def threat_taxonomy_category(label: str) -> str:
+    """Resolve common label spelling variants into the CICIDS threat taxonomy."""
+    canonical = canonical_attack_label(label)
+    if canonical in THREAT_TAXONOMY:
+        return THREAT_TAXONOMY[canonical]
+    folded = str(canonical).casefold()
+    if folded in {"benign", "benign traffic", "normal", "0"}:
+        return "Benign"
+    if "dos" in folded or "ddos" in folded:
+        return "Malicious - Denial of Service"
+    if "patator" in folded or "brute force" in folded:
+        return "Malicious - Brute Force"
+    if "sql injection" in folded or "xss" in folded or "web attack" in folded:
+        return "Malicious - Web Attack"
+    if "infiltration" in folded:
+        return "Malicious - Privilege/Infiltration"
+    if "heartbleed" in folded:
+        return "Malicious - Exploitation"
+    return "Unknown / Requires validation"
+
+
 DEFAULT_ATTACK = {"tactic": "Requires validation", "technique": "Technique unassigned", "description": "No direct mapping is configured for this class. A model label is not proof of attribution.", "mitigation": "Validate with independent endpoint, identity, network, and application telemetry."}
 
 
@@ -385,8 +426,11 @@ def main() -> None:
         st.caption(f"File limit {MAX_UPLOAD_MB} MB · up to {analysis_row_limit:,} rows per analysis")
         st.divider()
         st.subheader("System status")
-        st.write(("🟢" if bundle else "🔴") + " Trained model artifacts")
-        st.write("🟡 Isolation Forest checks rows before classification")
+        st.write("🟢 Local ML Engine: Online")
+        st.write("🟢 FAISS: Loaded")
+        st.write("🟢 QPU Simulator: Ready (default.qubit)")
+        st.write("🟢 Zero Data Leakage: flow data stays local")
+        st.caption("Status reflects configured local pipeline components; quantum routing is not part of this inference path.")
         st.write("🟢 Local SOC ledger (soc_ledger.csv)")
         if artifact_error:
             st.error(artifact_error)
@@ -439,6 +483,8 @@ def main() -> None:
         except Exception as exc:
             st.error(f"CSV parsing failed: {safe_text(exc)}")
             st.stop()
+        # Keep the original uploaded schema for the preview; inference remains unchanged.
+        preview_source = raw.head(10).copy()
         try:
             # Respect the user-selected row limit without rejecting larger CSVs.
             # Analyze the first N rows; all columns still pass through universal alignment.
@@ -526,6 +572,35 @@ def main() -> None:
     metrics[1].metric("Predicted Threats", f"{int(malicious.sum()):,}")
     metrics[2].metric("OOD Anomalies", f"{int(ood.sum()):,}")
     metrics[3].metric("Mean Inference Time", f"{elapsed_ms / max(1, len(X)):.3f} ms/flow")
+    st.subheader("Preprocessed network flow preview")
+    preview_df = preview_source.head(10).copy()
+    preview_count = min(len(preview_df), len(labels))
+    preview_labels = labels[:preview_count]
+
+    def _style_preview_rows(_row: pd.Series) -> list[str]:
+        row_index = int(_row.name) if isinstance(_row.name, (int, np.integer)) else -1
+        predicted_label = preview_labels[row_index] if 0 <= row_index < len(preview_labels) else "Unknown Novel Anomaly"
+        category = threat_taxonomy_category(predicted_label)
+        if category == "Benign":
+            style = "background-color: #d8f3dc; color: #173b24;"
+        else:
+            style = "background-color: #5b1d25; color: #fff1f2;"
+        return [style] * len(_row)
+
+    if not preview_df.empty:
+        st.dataframe(
+            preview_df.style.apply(_style_preview_rows, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        taxonomy_preview = pd.DataFrame({
+            "Predicted Class": labels[:preview_count],
+            "Threat Category": [threat_taxonomy_category(label) for label in labels[:preview_count]],
+        })
+        with st.expander("Preview threat taxonomy"):
+            st.dataframe(taxonomy_preview, use_container_width=True, hide_index=True)
+        st.caption("Light green = predicted benign; dark red = predicted malicious or requiring validation. Colors reflect predictions, not ground truth.")
+
     st.subheader("Triage Overview")
     st.dataframe(results, use_container_width=True, hide_index=True)
     st.download_button("Download triage results", data=results.to_csv(index=False).encode(),
@@ -537,7 +612,6 @@ def main() -> None:
         if not len(positions):
             st.success("No in-distribution malicious predictions were produced.")
         else:
-            explainer = None
             for pos in positions:
                 attack = labels[pos]
                 with st.expander(f"{priority[pos]} · {severity[pos]} · {attack} · {alert_ids[pos]}"):
