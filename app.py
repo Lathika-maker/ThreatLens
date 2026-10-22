@@ -41,6 +41,7 @@ EDGE_LOW, EDGE_HIGH = 0.40, 0.65
 DEFAULT_CHUNK_SIZE = 50_000
 MAX_ALERT_CARDS = 50
 PREVIEW_ROWS = 500
+MAX_QUANTUM_EVALUATIONS = 1_000
 
 # A small, curated local knowledge base. It is an illustrative subset of ATT&CK,
 # not a complete or automatically updated ATT&CK corpus.
@@ -334,7 +335,12 @@ def predict_chunk(frame: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
     out["Prediction_Label"] = np.where(out["Prediction"] == 1, "MALICIOUS", "BENIGN")
     out["Priority"] = np.where((probabilities >= 0.90) & (out["Prediction"] == 1), "HIGH",
                                np.where(out["Prediction"] == 1, "MEDIUM", "—"))
-    out["Quantum_Routed"] = (probabilities >= EDGE_LOW) & (probabilities <= EDGE_HIGH)
+    out["Quantum_Eligible"] = (probabilities >= EDGE_LOW) & (probabilities <= EDGE_HIGH)
+    out["Quantum_Routed"] = False
+    out["Quantum_Risk_Score"] = np.nan
+    out["Quantum_Route_Status"] = np.where(
+        out["Quantum_Eligible"], "Eligible; awaiting quantum evaluation", "Not eligible (outside score interval)"
+    )
     return out
 
 
@@ -433,7 +439,8 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
     missing_features_seen: set[str] = set()
     derived_features_total: dict[str, int] = {}
     invalid_numeric_cells_total = 0
-    total_rows = malicious_rows = high_rows = routed_rows = processed = 0
+    total_rows = malicious_rows = high_rows = routed_rows = eligible_rows = processed = 0
+    quantum_budget_remaining = MAX_QUANTUM_EVALUATIONS
     source_name = getattr(source, "name", "network.csv")
     digest = hashlib.sha256()
     # Rewind after each chunk reader; Pandas manages streaming CSV parsing.
@@ -451,7 +458,27 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
                 total_rows += len(predicted)
                 malicious_rows += int(predicted["Prediction"].sum())
                 high_rows += int((predicted["Priority"] == "HIGH").sum())
-                routed_rows += int(predicted["Quantum_Routed"].sum())
+                eligible_indices = predicted.index[predicted["Quantum_Eligible"]].tolist()
+                eligible_rows += len(eligible_indices)
+                # Spend the per-upload quantum budget on the scores closest to the
+                # classification boundary first. The circuit is never called outside
+                # the configured probability interval.
+                route_count = min(len(eligible_indices), quantum_budget_remaining)
+                if route_count:
+                    eligible_scores = predicted.loc[eligible_indices, "Threat_Probability"]
+                    selected_indices = (eligible_scores.sub(0.525).abs().nsmallest(route_count).index.tolist())
+                    for route_index in selected_indices:
+                        quantum_value = quantum_risk_score(predicted.loc[route_index], bundle)
+                        predicted.at[route_index, "Quantum_Risk_Score"] = quantum_value
+                        predicted.at[route_index, "Quantum_Routed"] = True
+                        predicted.at[route_index, "Quantum_Route_Status"] = "Evaluated by PennyLane default.qubit"
+                    quantum_budget_remaining -= route_count
+                    routed_rows += route_count
+                for route_index in eligible_indices:
+                    if not bool(predicted.at[route_index, "Quantum_Routed"]):
+                        predicted.at[route_index, "Quantum_Route_Status"] = (
+                            "Eligible but skipped: per-upload quantum simulation cap reached"
+                        )
                 if sum(len(part) for part in preview_parts) < PREVIEW_ROWS:
                     remaining = PREVIEW_ROWS - sum(len(part) for part in preview_parts)
                     preview_parts.append(predicted.head(remaining).copy())
@@ -471,7 +498,9 @@ def analyze_csv_in_chunks(source: Any, bundle: dict[str, Any],
         return {
             "output_path": output_path, "preview": preview, "alerts": alert_candidates,
             "total_rows": total_rows, "malicious_rows": malicious_rows, "high_rows": high_rows,
-            "routed_rows": routed_rows, "source_name": source_name,
+            "routed_rows": routed_rows, "eligible_rows": eligible_rows,
+            "quantum_skipped_rows": max(0, eligible_rows - routed_rows),
+            "source_name": source_name,
             "preprocessing": {
                 "missing_features": sorted(missing_features_seen),
                 "invalid_numeric_cells_replaced_with_zero": invalid_numeric_cells_total,
@@ -499,8 +528,10 @@ def build_alert_report(row: pd.Series, bundle: dict[str, Any],
     evidence = explain_flow(row, bundle)
     retrieval = retrieve_mitre(row, evidence, index, ids, embedder)
     probability = float(row["Threat_Probability"])
-    is_routed = EDGE_LOW <= probability <= EDGE_HIGH
-    quantum_score = quantum_risk_score(row, bundle) if is_routed else None
+    is_routed = bool(row.get("Quantum_Routed", False))
+    raw_quantum_score = row.get("Quantum_Risk_Score", np.nan)
+    quantum_score = float(raw_quantum_score) if pd.notna(raw_quantum_score) else None
+    route_status = str(row.get("Quantum_Route_Status", "Not routed"))
     return {
         "flow_id": str(row.get("Flow_ID", "Unknown")),
         "source_ip": str(row.get("Source_IP", "Unknown")),
@@ -508,7 +539,7 @@ def build_alert_report(row: pd.Series, bundle: dict[str, Any],
         "port": int(float(row["Destination_Port"])),
         "probability": probability, "priority": str(row["Priority"]),
         "evidence": evidence, "retrieval": retrieval,
-        "quantum_routed": is_routed, "quantum_score": quantum_score,
+        "quantum_routed": is_routed, "quantum_score": quantum_score, "quantum_route_status": route_status,
         "warning": str(row.get("Preprocessing_Warning", "None")),
     }
 
@@ -612,6 +643,11 @@ def main() -> None:
         else:
             st.success("All seven model feature columns were mapped or derived.")
         st.metric("Invalid numeric cells replaced with zero (whole file)", f"{invalid_cells:,}")
+        st.write(
+            f"Quantum score interval: {EDGE_LOW:.2f}–{EDGE_HIGH:.2f}. "
+            f"Eligible rows: {state.get('eligible_rows', 0):,}; circuit evaluations: {state.get('routed_rows', 0):,}; "
+            f"eligible rows skipped due to the {MAX_QUANTUM_EVALUATIONS:,}-evaluation cap: {state.get('quantum_skipped_rows', 0):,}."
+        )
         derived_features = prep_summary.get("derived_features", {})
         if derived_features:
             st.write("Derived feature values counted across chunks:", derived_features)
@@ -677,7 +713,7 @@ def main() -> None:
                     st.metric("Quantum circuit score (exploratory)", f"{report['quantum_score']:.3f}")
                     st.caption("Only run for XGBoost scores between 0.40 and 0.65 inclusive. This fixed-parameter simulator score is not a calibrated probability and does not override XGBoost.")
                 else:
-                    st.write("**Quantum edge-case resolver:** Not routed (classifier score outside 0.40–0.65).")
+                    st.write(f"**Quantum edge-case resolver:** {report['quantum_route_status']}.")
                 st.markdown("**SOC mitigation playbook**")
                 for step in technique["mitigations"]:
                     st.markdown(f"- {step}")
