@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import io
 import json
 import os
 import re
@@ -423,12 +424,22 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Data ingestion")
-        upload = st.file_uploader(
+        uploaded_file = st.file_uploader(
             "Upload network-flow CSV",
             type=["csv"],
             max_upload_size=MAX_UPLOAD_MB,
-            help="CSV files up to 100 MB. Analysis is limited by the row slider and available memory.",
+            help="CSV files up to 100 MB. Hashing happens on the raw bytes before pandas parses the file.",
         )
+        file_hash = None
+        source_bytes = None
+        if uploaded_file is not None:
+            source_bytes = uploaded_file.getvalue()
+            file_hash = hashlib.sha256(source_bytes).hexdigest()
+            st.session_state["source_file_sha256"] = file_hash
+            st.sidebar.success(f"Source File SHA-256: {file_hash}")
+        else:
+            st.session_state.pop("source_file_sha256", None)
+        upload = uploaded_file
         analysis_row_limit = st.slider(
             "Rows to analyze",
             min_value=10_000,
@@ -440,13 +451,14 @@ def main() -> None:
         st.caption("Columns are aligned automatically to the model's 40 features.")
         suppression_threshold = st.sidebar.slider(
             "🛡️ Anti-Fatigue Confidence Threshold",
-            min_value=50, max_value=99, value=90, step=1,
-            help="Suppress XGBoost alerts at or below this confidence and consolidate duplicate source-IP/threat-class pairs. Threat Vault similarity is not a calibrated attack probability; overrides are preserved.",
+            min_value=50,
+            max_value=99,
+            value=90,
         )
-        file_hash = None
-        if upload is not None:
-            file_hash = hashlib.sha256(upload.getvalue()).hexdigest()
-            st.sidebar.success(f"Source File SHA-256: {file_hash}")
+        st.caption(
+            "Keep XGBoost alerts only when class confidence is strictly greater than this threshold. "
+            "Duplicate source-IP / threat-class pairs are collapsed. Threat Vault overrides are preserved."
+        )
         if "active_mode" not in st.session_state:
             st.session_state.active_mode = "csv"
         if "current_simulated_row" not in st.session_state:
@@ -548,7 +560,8 @@ def main() -> None:
             st.error(f"Upload rejected: file exceeds {MAX_UPLOAD_MB} MB.")
             st.stop()
         try:
-            raw = pd.read_csv(upload, low_memory=False)
+            csv_bytes = source_bytes if source_bytes is not None else uploaded_file.getvalue()
+            raw = pd.read_csv(io.BytesIO(csv_bytes), low_memory=False)
         except Exception as exc:
             st.error(f"CSV parsing failed: {safe_text(exc)}")
             st.stop()
@@ -628,7 +641,6 @@ def main() -> None:
         for i in range(len(X))
     ]
     # Stable IDs keep per-alert UI state attached to the same flow across Streamlit reruns.
-    import hashlib
     alert_ids = [
         "TL-" + hashlib.sha256(
             (str(i) + "|" + ",".join(f"{float(v):.12g}" for v in X.iloc[i].to_numpy(dtype=float))).encode("utf-8")
@@ -640,9 +652,10 @@ def main() -> None:
         "Class Confidence": confidence,
         "Distribution Status": ["Threat Vault Override" if vault_hit[i] else "Unknown Novel Anomaly" if ood[i] else "In-distribution" for i in range(len(X))],
         "Vault Cosine Similarity": [float(vault_similarities[i]) if vault_hit[i] else np.nan for i in range(len(X))],
-        "Severity": severity,
     })
 
+    if file_hash:
+        st.caption(f"Source evidence digest captured before pandas parse: `{file_hash}`")
     metrics = st.columns(4)
     metrics[0].metric("Total Flows", f"{len(X):,}")
     metrics[1].metric("Predicted Threats", f"{int(malicious.sum()):,}")
@@ -673,11 +686,6 @@ def main() -> None:
     )
 
     if not preview_df.empty:
-        # Keep one unified review table. Pandas Styler creates per-cell CSS and can
-        # exceed Streamlit's rendering limit for large uploads, so style a bounded
-        # head and use Streamlit's native virtualized dataframe for the full dataset.
-        STYLE_PREVIEW_ROWS = 1000
-
         def _flow_row_style(row):
             category = str(row.get("Threat Category", "Unknown / Requires validation"))
             status = str(row.get("Analysis Status", ""))
@@ -690,23 +698,9 @@ def main() -> None:
             return [f"background-color: {background}; color: {foreground};" for _ in row]
 
         st.markdown("**Threat coloring:** 🟩 Benign · 🟥 Malicious / requires validation · 🟨 Not analyzed")
-        display_df = preview_df.copy()
-        # Bound Styler rendering to 1,000 rows to prevent browser-memory crashes.
-        visible_df = display_df.head(1000)
-        styled_head = visible_df.style.apply(_flow_row_style, axis=1)
-        # Size the table to its actual visible row count so Streamlit does not
-        # render empty placeholder rows beneath small datasets.
-        table_height = min(400, max(95, 38 + 35 * len(visible_df)))
-        st.dataframe(
-            styled_head,
-            use_container_width=True,
-            height=table_height,
-            hide_index=True,
-        )
-        st.caption(
-            "UI Rendering capped at top 1,000 rows to preserve browser memory. "
-            "The full dataset is processed securely in the backend."
-        )
+        table_height = min(400, max(95, 38 + 35 * min(len(preview_df), 1000)))
+        st.dataframe(preview_df.head(1000).style.apply(_flow_row_style, axis=1), use_container_width=True, height=table_height, hide_index=True)
+        st.caption("UI Rendering capped at top 1,000 rows to preserve browser memory. The full dataset is processed securely in the backend.")
         st.caption(
             "Why a row is red: the active detection pipeline predicted a non-benign class or marked it for review. "
             "Green means predicted benign; amber means it was outside the selected analysis limit. "
@@ -760,12 +754,11 @@ def main() -> None:
             )
             seen_alert_keys = set()
             kept_positions = []
-            threshold = suppression_threshold / 100.0
 
             for pos in original_alerts:
                 is_vault_override = bool(vault_hit[pos])
                 # Apply the threshold only to XGBoost confidence; preserve vault overrides.
-                if not is_vault_override and float(model_confidence[pos]) <= threshold:
+                if not is_vault_override and not (float(model_confidence[pos]) > (suppression_threshold / 100.0)):
                     low_confidence_suppressed += 1
                     continue
                 if source_ip_column is not None and pos < len(preview_source):
@@ -786,25 +779,33 @@ def main() -> None:
 
             positions = np.asarray(kept_positions, dtype=int)
             alerts_suppressed = low_confidence_suppressed + duplicate_suppressed
-            st.info(
-                f"**Metric A — Suppressed by threshold/deduplication:** {alerts_suppressed:,} alerts "
-                f"({low_confidence_suppressed:,} at or below the {suppression_threshold}% XGBoost threshold; "
-                f"{duplicate_suppressed:,} duplicate source-IP/class alerts)."
-            )
-            st.info(
-                f"**Threat Vault safety:** preserved {vault_preserved:,} override candidates. "
-                "Cosine similarity is not treated as classifier probability."
-            )
         else:
             positions = original_alerts.copy()
+            alerts_suppressed = 0
 
         consolidated_count = len(positions)
         display_cap_hidden = max(0, consolidated_count - MAX_ALERTS)
         positions = positions[:MAX_ALERTS]
         st.info(
-            f"**Metric B — Hidden only by the {MAX_ALERTS}-alert display cap:** "
-            f"{display_cap_hidden:,} qualifying alerts. Showing {len(positions):,} of "
-            f"{consolidated_count:,} alerts remaining after filtering."
+            f"**Metric A — Suppressed by threshold/deduplication:** {alerts_suppressed:,} alerts "
+            f"({low_confidence_suppressed:,} below or equal to the {suppression_threshold}% XGBoost threshold; "
+            f"{duplicate_suppressed:,} duplicate source-IP/class alerts)."
+        )
+        if display_cap_hidden:
+            st.info(
+                f"**Metric B — Omitted only by the {MAX_ALERTS}-alert display cap:** "
+                f"{display_cap_hidden:,} qualifying alerts. Showing {len(positions):,} of "
+                f"{consolidated_count:,} alerts remaining after filtering."
+            )
+        else:
+            st.success(
+                f"**Metric B — Omitted only by the {MAX_ALERTS}-alert display cap:** "
+                f"{display_cap_hidden:,} qualifying alerts. Showing {len(positions):,} of "
+                f"{consolidated_count:,} alerts remaining after filtering."
+            )
+        st.caption(
+            f"Threat Vault safety: preserved {vault_preserved:,} override candidates. "
+            "Cosine similarity is not treated as classifier probability."
         )
         st.caption(
             f"Anti-Fatigue threshold: XGBoost confidence must be strictly greater than {suppression_threshold}%. "
@@ -926,7 +927,6 @@ def main() -> None:
 
                         st.markdown("**Cryptographic Chain-of-Custody**")
                         try:
-                            import hashlib
                             raw_values = np.asarray(X.iloc[pos], dtype=np.float64)
                             canonical_bytes = json.dumps(
                                 [None if not np.isfinite(v) else float(v) for v in raw_values],
@@ -953,6 +953,7 @@ def main() -> None:
                                 "priority": priority[pos],
                                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                                 "flow_feature_sha256": flow_sha256,
+                                "source_file_sha256": st.session_state.get("source_file_sha256"),
                                 "hash_description": "SHA-256 of the ordered, aligned numeric feature values used for inference; it verifies this representation, not source-file authenticity.",
                                 "shap_top_features": shap_report_features,
                                 "mitre_attack": {"tactic": mitre.get("tactic", DEFAULT_ATTACK["tactic"]),
