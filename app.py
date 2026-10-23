@@ -437,7 +437,15 @@ def main() -> None:
             help="Choose how many rows from the beginning of the uploaded CSV to analyze. Extra columns are automatically removed and missing model features are zero-filled.",
         )
         st.caption("Columns are aligned automatically to the model's 40 features.")
-        suppression_engine = st.sidebar.toggle("🛡️ Enable Anti-Fatigue Suppression", value=True, help="Hide alerts below 90% score and consolidate repeated source-IP / threat-class pairs.")
+        suppression_threshold = st.sidebar.slider(
+            "🛡️ Anti-Fatigue Confidence Threshold",
+            min_value=50, max_value=99, value=90, step=1,
+            help="Suppress XGBoost alerts at or below this confidence and consolidate duplicate source-IP/threat-class pairs. Threat Vault similarity is not a calibrated attack probability; overrides are preserved.",
+        )
+        file_hash = None
+        if upload is not None:
+            file_hash = hashlib.sha256(upload.getvalue()).hexdigest()
+            st.sidebar.success(f"Source File SHA-256: {file_hash}")
         if "active_mode" not in st.session_state:
             st.session_state.active_mode = "csv"
         if "current_simulated_row" not in st.session_state:
@@ -670,18 +678,13 @@ def main() -> None:
 
         st.markdown("**Threat coloring:** 🟩 Benign · 🟥 Malicious / requires validation · 🟨 Not analyzed")
         display_df = preview_df.copy()
-        styled_head = display_df.head(STYLE_PREVIEW_ROWS).style.apply(_flow_row_style, axis=1)
-        # Fit small tables to their actual row count to avoid empty-looking filler rows.
-        table_height = min(400, max(95, 38 * (min(len(display_df), 10) + 1)))
-        if len(display_df) <= STYLE_PREVIEW_ROWS:
-            st.dataframe(styled_head, use_container_width=True, height=table_height, hide_index=True)
-        else:
-            st.dataframe(display_df, use_container_width=True, height=400, hide_index=True)
-            st.caption(
-                f"All {len(display_df):,} rows are in this single scrollable table. For performance, "
-                f"cell-level coloring is limited to datasets with {STYLE_PREVIEW_ROWS:,} rows or fewer; "
-                "larger tables retain prediction labels and review flags for every row."
-            )
+        # Bound Styler rendering to 1,000 rows to prevent browser-memory crashes.
+        styled_head = display_df.head(1000).style.apply(_flow_row_style, axis=1)
+        st.dataframe(styled_head, use_container_width=True, height=400, hide_index=True)
+        st.caption(
+            "UI Rendering capped at top 1,000 rows to preserve browser memory. "
+            "The full dataset is processed securely in the backend."
+        )
         st.caption(
             "Why a row is red: the active detection pipeline predicted a non-benign class or marked it for review. "
             "Green means predicted benign; amber means it was outside the selected analysis limit. "
@@ -727,7 +730,7 @@ def main() -> None:
         duplicate_suppressed = 0
         vault_preserved = int(np.sum(np.asarray(vault_hit, dtype=bool)[original_alerts]))
 
-        if suppression_engine and len(original_alerts):
+        if len(original_alerts):
             source_ip_column = next(
                 (column for column in preview_source.columns
                  if normalize_column(str(column)).lower() in {"source_ip", "src_ip", "sourceip", "srcip"}),
@@ -735,25 +738,22 @@ def main() -> None:
             )
             seen_alert_keys = set()
             kept_positions = []
+            threshold = suppression_threshold / 100.0
+
             for pos in original_alerts:
                 is_vault_override = bool(vault_hit[pos])
-                # Safety guard: never suppress a Threat Vault override based on its
-                # cosine similarity. That score is semantic proximity, not probability.
-                if not is_vault_override and float(model_confidence[pos]) <= 0.90:
+                # Apply the threshold only to XGBoost confidence; preserve vault overrides.
+                if not is_vault_override and float(model_confidence[pos]) <= threshold:
                     low_confidence_suppressed += 1
                     continue
-
                 if source_ip_column is not None and pos < len(preview_source):
                     source_ip = str(preview_source.iloc[int(pos)][source_ip_column]).strip()
                     if not source_ip or source_ip.lower() in {"nan", "none"}:
                         source_ip = f"row:{int(pos)}"
                 else:
-                    # Missing source IP means we cannot safely establish duplication.
                     source_ip = f"row:{int(pos)}"
 
                 threat_class = str(labels[pos])
-                # Keep vault overrides separate from classifier alerts so the scores
-                # are never compared when choosing which duplicate to retain.
                 score_kind = "vault" if is_vault_override else "xgboost"
                 dedupe_key = (score_kind, source_ip, threat_class)
                 if dedupe_key in seen_alert_keys:
@@ -763,30 +763,32 @@ def main() -> None:
                 kept_positions.append(int(pos))
 
             positions = np.asarray(kept_positions, dtype=int)
-            alerts_suppressed = len(original_alerts) - len(positions)
-            st.success(
-                f"Anti-Fatigue Engine Active: filtered {alerts_suppressed:,} alerts "
-                f"({low_confidence_suppressed:,} lower-confidence classifier alerts and "
-                f"{duplicate_suppressed:,} duplicate classifier/override alerts). "
-                f"Preserved all {vault_preserved:,} Threat Vault override candidates."
+            alerts_suppressed = low_confidence_suppressed + duplicate_suppressed
+            st.info(
+                f"**Metric A — Suppressed by threshold/deduplication:** {alerts_suppressed:,} alerts "
+                f"({low_confidence_suppressed:,} at or below the {suppression_threshold}% XGBoost threshold; "
+                f"{duplicate_suppressed:,} duplicate source-IP/class alerts)."
+            )
+            st.info(
+                f"**Threat Vault safety:** preserved {vault_preserved:,} override candidates. "
+                "Cosine similarity is not treated as classifier probability."
             )
         else:
-            # Suppression disabled: preserve the existing raw top-alert list.
             positions = original_alerts.copy()
 
         consolidated_count = len(positions)
+        display_cap_hidden = max(0, consolidated_count - MAX_ALERTS)
         positions = positions[:MAX_ALERTS]
-        display_cap_hidden = max(0, consolidated_count - len(positions))
-        if suppression_engine:
-            st.caption(
-                f"Suppression audit: {len(original_alerts):,} malicious candidates → "
-                f"{consolidated_count:,} after filtering → {len(positions):,} shown. "
-                f"Display cap independently hides {display_cap_hidden:,} qualifying alerts. "
-                "The >90% threshold applies only to XGBoost classifier confidence. Threat Vault "
-                "overrides are preserved because cosine similarity is not attack probability. "
-                "Duplicate consolidation uses (score source, source IP, predicted class); rows "
-                "without a usable source IP are retained separately. Original predictions are unchanged."
-            )
+        st.info(
+            f"**Metric B — Hidden only by the {MAX_ALERTS}-alert display cap:** "
+            f"{display_cap_hidden:,} qualifying alerts. Showing {len(positions):,} of "
+            f"{consolidated_count:,} alerts remaining after filtering."
+        )
+        st.caption(
+            f"Anti-Fatigue threshold: XGBoost confidence must be strictly greater than {suppression_threshold}%. "
+            "Threat Vault overrides are preserved; their cosine similarity is not a calibrated attack probability. "
+            "Filtering changes the triage display only, not model predictions or uploaded evidence."
+        )
         if not len(positions):
             st.success("No alerts remain in the triage list under the current suppression settings.")
         else:
