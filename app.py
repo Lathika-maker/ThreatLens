@@ -683,9 +683,10 @@ def main() -> None:
                 "larger tables retain prediction labels and review flags for every row."
             )
         st.caption(
-            "Green = predicted benign; red = malicious or requires validation; amber = "
-            "not analyzed because of the row limit. Model predictions are not proof of "
-            "compromise; corroborate with independent telemetry."
+            "Why a row is red: the active detection pipeline predicted a non-benign class or marked it for review. "
+            "Green means predicted benign; amber means it was outside the selected analysis limit. "
+            "The model/Threat Vault routing chooses the class; color is only a display aid. "
+            "Predictions are investigation candidates, not proof of compromise."
         )
 
     st.subheader("Triage Overview")
