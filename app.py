@@ -708,18 +708,26 @@ def main() -> None:
     alert_tab, ood_tab, ledger_tab = st.tabs(["Threat investigation", "Unknown/OOD anomalies", "SOC incident ledger"])
     with alert_tab:
         candidate_positions = np.flatnonzero(malicious)
-        # Keep a stable, score-descending copy of all malicious candidates before suppression.
-        score_for_triage = np.where(vault_hit, vault_similarities, confidence).astype(float)
+        # Keep score types separate: XGBoost class confidence and Threat Vault cosine
+        # similarity are not comparable and must never share a numeric threshold.
+        model_confidence = np.nan_to_num(
+            np.asarray(confidence, dtype=float), nan=-1.0, posinf=1.0, neginf=-1.0
+        )
+        vault_similarity = np.nan_to_num(
+            np.asarray(vault_similarities, dtype=float), nan=-1.0, posinf=1.0, neginf=-1.0
+        )
+        score_for_triage = np.where(vault_hit, vault_similarity, model_confidence)
         score_for_triage = np.nan_to_num(score_for_triage, nan=-1.0, posinf=1.0, neginf=-1.0)
         original_alerts = candidate_positions[
             np.argsort(score_for_triage[candidate_positions])[::-1]
         ]
         positions = original_alerts.copy()
         alerts_suppressed = 0
+        low_confidence_suppressed = 0
+        duplicate_suppressed = 0
+        vault_preserved = int(np.sum(np.asarray(vault_hit, dtype=bool)[original_alerts]))
 
         if suppression_engine and len(original_alerts):
-            # Use the uploaded source-IP column when available. Otherwise, keep rows
-            # distinct rather than accidentally suppressing unrelated events.
             source_ip_column = next(
                 (column for column in preview_source.columns
                  if normalize_column(str(column)).lower() in {"source_ip", "src_ip", "sourceip", "srcip"}),
@@ -728,19 +736,28 @@ def main() -> None:
             seen_alert_keys = set()
             kept_positions = []
             for pos in original_alerts:
-                score = float(score_for_triage[pos])
-                if score <= 0.90:
+                is_vault_override = bool(vault_hit[pos])
+                # Safety guard: never suppress a Threat Vault override based on its
+                # cosine similarity. That score is semantic proximity, not probability.
+                if not is_vault_override and float(model_confidence[pos]) <= 0.90:
+                    low_confidence_suppressed += 1
                     continue
+
                 if source_ip_column is not None and pos < len(preview_source):
                     source_ip = str(preview_source.iloc[int(pos)][source_ip_column]).strip()
                     if not source_ip or source_ip.lower() in {"nan", "none"}:
                         source_ip = f"row:{int(pos)}"
                 else:
+                    # Missing source IP means we cannot safely establish duplication.
                     source_ip = f"row:{int(pos)}"
+
                 threat_class = str(labels[pos])
-                dedupe_key = (source_ip, threat_class)
-                # Already sorted by score: first occurrence is the highest-scoring alert.
+                # Keep vault overrides separate from classifier alerts so the scores
+                # are never compared when choosing which duplicate to retain.
+                score_kind = "vault" if is_vault_override else "xgboost"
+                dedupe_key = (score_kind, source_ip, threat_class)
                 if dedupe_key in seen_alert_keys:
+                    duplicate_suppressed += 1
                     continue
                 seen_alert_keys.add(dedupe_key)
                 kept_positions.append(int(pos))
@@ -748,11 +765,14 @@ def main() -> None:
             positions = np.asarray(kept_positions, dtype=int)
             alerts_suppressed = len(original_alerts) - len(positions)
             st.success(
-                f"Anti-Fatigue Engine Active: Auto-suppressed {alerts_suppressed} redundant or low-confidence alerts."
+                f"Anti-Fatigue Engine Active: filtered {alerts_suppressed:,} alerts "
+                f"({low_confidence_suppressed:,} lower-confidence classifier alerts and "
+                f"{duplicate_suppressed:,} duplicate classifier/override alerts). "
+                f"Preserved all {vault_preserved:,} Threat Vault override candidates."
             )
         else:
             # Suppression disabled: preserve the existing raw top-alert list.
-            positions = original_alerts[:MAX_ALERTS]
+            positions = original_alerts.copy()
 
         consolidated_count = len(positions)
         positions = positions[:MAX_ALERTS]
@@ -760,12 +780,12 @@ def main() -> None:
         if suppression_engine:
             st.caption(
                 f"Suppression audit: {len(original_alerts):,} malicious candidates → "
-                f"{consolidated_count:,} after confidence/deduplication filters → "
-                f"{len(positions):,} shown (display cap: {MAX_ALERTS}). "
-                "Confidence threshold is >90%; duplicate key is (source IP, predicted class); "
-                "score-descending order ensures the highest-scoring duplicate is retained. "
-                f"{display_cap_hidden:,} additional qualifying alerts are hidden only by the display cap. "
-                "Source rows and model predictions are not deleted or changed."
+                f"{consolidated_count:,} after filtering → {len(positions):,} shown. "
+                f"Display cap independently hides {display_cap_hidden:,} qualifying alerts. "
+                "The >90% threshold applies only to XGBoost classifier confidence. Threat Vault "
+                "overrides are preserved because cosine similarity is not attack probability. "
+                "Duplicate consolidation uses (score source, source IP, predicted class); rows "
+                "without a usable source IP are retained separately. Original predictions are unchanged."
             )
         if not len(positions):
             st.success("No alerts remain in the triage list under the current suppression settings.")
