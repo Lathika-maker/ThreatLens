@@ -808,8 +808,11 @@ def main() -> None:
                         elif vault_hit[pos]:
                             st.info("This alert was assigned by Threat Vault prototype similarity, not XGBoost class probabilities.")
                         st.markdown("**Contextual Match Confidence**")
-                        st.write(f"{match:.1f}%" if match is not None else "Unavailable")
-                        st.caption("Semantic proximity in the curated reference corpus, not a calibrated attack probability.")
+                        st.write(f"{match:.1f} / 100" if match is not None else "Unavailable")
+                        st.caption(
+                            "Similarity-derived relevance to the nearest local reference entry, not a calibrated attack probability. "
+                            "Unavailable means local embedding/index retrieval did not complete."
+                        )
                     with right:
                         st.markdown("### FAISS retrieval and SOC playbook")
                         st.markdown(f"**MITRE ATT&CK Tactic:** {mitre.get('tactic', DEFAULT_ATTACK['tactic'])}")
