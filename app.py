@@ -669,21 +669,18 @@ def main() -> None:
             return [f"background-color: {background}; color: {foreground};" for _ in row]
 
         st.markdown("**Threat coloring:** 🟩 Benign · 🟥 Malicious / requires validation · 🟨 Not analyzed")
-        # Display one table only: the first 1,000 rows are styled; the rest are
-        # still present in this same table, but unstyled for scalability.
         display_df = preview_df.copy()
         styled_head = display_df.head(STYLE_PREVIEW_ROWS).style.apply(_flow_row_style, axis=1)
+        # Fit small tables to their actual row count to avoid empty-looking filler rows.
+        table_height = min(400, max(95, 38 * (min(len(display_df), 10) + 1)))
         if len(display_df) <= STYLE_PREVIEW_ROWS:
-            st.dataframe(styled_head, use_container_width=True, height=400, hide_index=True)
+            st.dataframe(styled_head, use_container_width=True, height=table_height, hide_index=True)
         else:
-            # Single continuous table and single scroll surface. Avoid Styler for the
-            # full dataset because it serializes CSS for every cell and can crash.
             st.dataframe(display_df, use_container_width=True, height=400, hide_index=True)
             st.caption(
-                f"Showing all {len(display_df):,} rows in one table. To avoid rendering "
-                f"errors on large CSVs, native table rendering is used instead of per-cell "
-                f"Styler colors above {STYLE_PREVIEW_ROWS:,} rows. Prediction labels and "
-                "Review Flag remain visible for every row."
+                f"All {len(display_df):,} rows are in this single scrollable table. For performance, "
+                f"cell-level coloring is limited to datasets with {STYLE_PREVIEW_ROWS:,} rows or fewer; "
+                "larger tables retain prediction labels and review flags for every row."
             )
         st.caption(
             "Green = predicted benign; red = malicious or requires validation; amber = "
