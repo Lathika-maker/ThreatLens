@@ -626,7 +626,15 @@ def main() -> None:
     metrics[0].metric("Total Flows", f"{len(X):,}")
     metrics[1].metric("Predicted Threats", f"{int(malicious.sum()):,}")
     metrics[2].metric("OOD Anomalies", f"{int(ood.sum()):,}")
-    metrics[3].metric("Mean Inference Time", f"{elapsed_ms / max(1, len(X)):.3f} ms/flow")
+    mean_ms = elapsed_ms / max(1, len(X))
+    metrics[3].metric("Mean Inference Time", f"{mean_ms:.3f} ms/flow")
+    with st.expander("How to read these operational metrics", expanded=False):
+        st.markdown(
+            f"- **Total Flows ({len(X):,}):** rows actually analyzed; rows beyond the selected analysis limit are excluded.\n"
+            f"- **Predicted Threats ({int(malicious.sum()):,}):** rows routed as non-benign by the active pipeline, including Threat Vault overrides where applicable. These are review candidates, not confirmed incidents.\n"
+            f"- **OOD Anomalies ({int(ood.sum()):,}):** rows that differ from the training distribution; this is a novelty warning, not an attack label.\n"
+            f"- **Mean Inference Time ({mean_ms:.3f} ms/flow):** elapsed analysis time divided by analyzed rows; it measures responsiveness, not detection quality."
+        )
     st.subheader("Preprocessed network flow preview")
     preview_df = preview_source.copy().reset_index(drop=True)
     preview_count = min(len(preview_df), len(labels))
