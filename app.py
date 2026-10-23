@@ -866,6 +866,12 @@ def main() -> None:
                                 separators=(",", ":"), ensure_ascii=False,
                             ).encode("utf-8")
                             flow_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+                            st.caption("Flow feature SHA-256 — hash of the ordered numeric values used for this alert:")
+                            st.code(flow_sha256, language=None)
+                            st.caption(
+                                "This digest identifies the normalized feature representation for comparison. "
+                                "It is not a row number, threat score, or proof that the original CSV was untampered."
+                            )
                             shap_report_features = [
                                 {"feature": item.get("feature"), "shap_value": item.get("shap_value"),
                                  "absolute_shap": item.get("absolute_shap")}
