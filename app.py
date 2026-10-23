@@ -690,6 +690,17 @@ def main() -> None:
         )
 
     st.subheader("Triage Overview")
+    if simulate_mode:
+        st.caption(
+            "Only one row appears because a simulation button deliberately runs one deterministic Threat Vault prototype "
+            "to smoke-test routing and UI wiring. It is not a full-dataset result and does not measure real-world accuracy. "
+            "Choose “Analyze uploaded CSV” to see triage for the uploaded data."
+        )
+    else:
+        st.caption(
+            f"This table summarizes the {len(results):,} analyzed flow rows. Threat rows are selected by the active "
+            "model/Threat Vault routing; severity and priority are triage recommendations, not ground-truth labels."
+        )
     st.dataframe(results, use_container_width=True, hide_index=True)
     st.download_button("Download triage results", data=results.to_csv(index=False).encode(),
         file_name="threatlens_triage_results.csv", mime="text/csv")
