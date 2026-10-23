@@ -474,10 +474,22 @@ def main() -> None:
         st.divider()
         st.subheader("System status")
         st.write(f"{'🟢' if bundle is not None and bundle.get('model') is not None else '🔴'} Local ML Engine: {'Online' if bundle is not None and bundle.get('model') is not None else 'Unavailable'}")
-        faiss_ready = bool(bundle is not None and bundle.get("index") is not None)
-        st.write(f"{'🟢' if faiss_ready else '🔴'} FAISS: {'Loaded' if faiss_ready else 'Not initialized'}")
-        qpu_ready = bool(bundle is not None and bundle.get("qpu_simulator") is not None)
-        st.write(f"{'🟢' if qpu_ready else '🔴'} QPU Simulator: {'Configured' if qpu_ready else 'Not configured (not used by inference)'}")
+        # Check the actual cached FAISS + embedding resources used by MITRE retrieval.
+        # The model bundle does not store an "index" key, so checking bundle["index"]
+        # incorrectly showed FAISS as unavailable even when retrieval could initialize.
+        try:
+            rag_index, rag_records = load_rag_resources()
+            faiss_ready = rag_index is not None and rag_index.ntotal > 0 and bool(rag_records)
+            faiss_error = None if faiss_ready else "Index is empty"
+        except Exception as exc:
+            faiss_ready = False
+            faiss_error = f"{type(exc).__name__}: {safe_text(exc, 180)}"
+        st.write(f"{'🟢' if faiss_ready else '🔴'} FAISS retrieval: {'Ready' if faiss_ready else 'Unavailable'}")
+        if not faiss_ready:
+            st.caption(f"FAISS initialization check: {faiss_error}")
+        # QPU simulation is an optional, unused-by-default feature; do not imply
+        # the core app is unhealthy just because no simulator is configured.
+        st.write("⚪ QPU Simulator: Optional — not configured (not used by inference)")
         local_storage_ready = bool(ARTIFACT_DIR.exists() and os.access(ARTIFACT_DIR, os.R_OK))
         st.write(f"{'🟢' if local_storage_ready else '🔴'} Local data access: {'Available' if local_storage_ready else 'Check artifact-directory access'}")
         st.caption("Badges reflect runtime checks. This build does not route inference through a QPU unless a simulator is explicitly configured.")
