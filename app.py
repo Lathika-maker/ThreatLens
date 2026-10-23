@@ -772,10 +772,12 @@ def main() -> None:
                     mitre = get_mitre_details(canonical_attack)
                     match = None
                     try:
+                        retrieved_mitre, match = retrieve_mitre(attack)
                         if canonical_attack not in MITRE_MAP:
-                            mitre, match = retrieve_mitre(attack)
-                    except Exception as exc:
-                        st.warning(f"Semantic retrieval unavailable ({type(exc).__name__}); showing static guidance.")
+                            mitre = retrieved_mitre
+                    except Exception:
+                        # Keep static MITRE guidance, but do not fabricate a contextual score.
+                        match = None
                     left, right = st.columns([1, 1.4])
                     with left:
                         st.markdown("**Prediction evidence**")
