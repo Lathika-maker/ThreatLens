@@ -743,7 +743,19 @@ def main() -> None:
             # Suppression disabled: preserve the existing raw top-alert list.
             positions = original_alerts[:MAX_ALERTS]
 
+        consolidated_count = len(positions)
         positions = positions[:MAX_ALERTS]
+        display_cap_hidden = max(0, consolidated_count - len(positions))
+        if suppression_engine:
+            st.caption(
+                f"Suppression audit: {len(original_alerts):,} malicious candidates → "
+                f"{consolidated_count:,} after confidence/deduplication filters → "
+                f"{len(positions):,} shown (display cap: {MAX_ALERTS}). "
+                "Confidence threshold is >90%; duplicate key is (source IP, predicted class); "
+                "score-descending order ensures the highest-scoring duplicate is retained. "
+                f"{display_cap_hidden:,} additional qualifying alerts are hidden only by the display cap. "
+                "Source rows and model predictions are not deleted or changed."
+            )
         if not len(positions):
             st.success("No alerts remain in the triage list under the current suppression settings.")
         else:
