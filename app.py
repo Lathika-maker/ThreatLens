@@ -679,8 +679,17 @@ def main() -> None:
         st.markdown("**Threat coloring:** 🟩 Benign · 🟥 Malicious / requires validation · 🟨 Not analyzed")
         display_df = preview_df.copy()
         # Bound Styler rendering to 1,000 rows to prevent browser-memory crashes.
-        styled_head = display_df.head(1000).style.apply(_flow_row_style, axis=1)
-        st.dataframe(styled_head, use_container_width=True, height=400, hide_index=True)
+        visible_df = display_df.head(1000)
+        styled_head = visible_df.style.apply(_flow_row_style, axis=1)
+        # Size the table to its actual visible row count so Streamlit does not
+        # render empty placeholder rows beneath small datasets.
+        table_height = min(400, max(95, 38 + 35 * len(visible_df)))
+        st.dataframe(
+            styled_head,
+            use_container_width=True,
+            height=table_height,
+            hide_index=True,
+        )
         st.caption(
             "UI Rendering capped at top 1,000 rows to preserve browser memory. "
             "The full dataset is processed securely in the backend."
