@@ -468,11 +468,14 @@ def main() -> None:
         st.write(f"{'🟢' if bundle is not None and bundle.get('model') is not None else '🔴'} Local ML Engine: {'Online' if bundle is not None and bundle.get('model') is not None else 'Unavailable'}")
         faiss_ready = bool(bundle is not None and bundle.get("index") is not None)
         st.write(f"{'🟢' if faiss_ready else '🔴'} FAISS: {'Loaded' if faiss_ready else 'Not initialized'}")
-        st.write("🟡 QPU Simulator: Display-only status (not used by current inference path)")
-        st.write("🟢 Zero Data Leakage: flow data stays local")
-        st.caption("Status reflects components exposed by the current local app; quantum routing is not part of this inference path.")
+        qpu_ready = bool(bundle is not None and bundle.get("qpu_simulator") is not None)
+        st.write(f"{'🟢' if qpu_ready else '🔴'} QPU Simulator: {'Configured' if qpu_ready else 'Not configured (not used by inference)'}")
+        local_storage_ready = bool(ARTIFACT_DIR.exists() and os.access(ARTIFACT_DIR, os.R_OK))
+        st.write(f"{'🟢' if local_storage_ready else '🔴'} Local data access: {'Available' if local_storage_ready else 'Check artifact-directory access'}")
+        st.caption("Badges reflect runtime checks. This build does not route inference through a QPU unless a simulator is explicitly configured.")
         ledger_path = get_soc_ledger_path()
-        st.write(f"{'🟢' if ledger_path.parent.exists() and os.access(ledger_path.parent, os.W_OK) else '🔴'} Local SOC ledger: {'Writable' if os.access(ledger_path.parent, os.W_OK) else 'Not writable'}")
+        ledger_writable = ledger_path.parent.exists() and os.access(ledger_path.parent, os.W_OK)
+        st.write(f"{'🟢' if ledger_writable else '🔴'} Local SOC ledger: {'Writable' if ledger_writable else 'Not writable'}")
         if artifact_error:
             st.error(artifact_error)
 
